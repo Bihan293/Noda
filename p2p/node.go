@@ -866,9 +866,8 @@ func (n *Node) handleTx(p *Peer, msg *Message) error {
 
 	slog.Info("TX accepted from peer",
 		"peer", p.Addr,
-		"from", shortAddr(tx.From),
-		"to", shortAddr(tx.To),
-		"amount", tx.Amount,
+		"inputs", len(tx.Inputs),
+		"outputs", len(tx.Outputs),
 	)
 
 	// Relay to other peers who don't know about it.

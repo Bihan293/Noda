@@ -103,8 +103,8 @@ func (bc *Blockchain) AddBlock(b *block.Block) error {
 	}
 
 	// Track mined coins from coinbase transaction (first TX in block, if coinbase).
-	if len(b.Transactions) > 0 && b.Transactions[0].From == "" && b.Header.Height > 0 {
-		bc.TotalMined += b.Transactions[0].Amount
+	if len(b.Transactions) > 0 && b.Transactions[0].IsCoinbase() && b.Header.Height > 0 {
+		bc.TotalMined += b.Transactions[0].TotalOutputValue()
 	}
 
 	bc.Blocks = append(bc.Blocks, b)
@@ -218,4 +218,19 @@ func ValidateChain(bc *Blockchain) error {
 	}
 
 	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Legacy Detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ContainsLegacyBlocks checks if the chain contains legacy account-model transactions.
+// Returns true and the first offending block height if legacy data is detected.
+func ContainsLegacyBlocks(bc *Blockchain) (bool, uint64) {
+	for _, b := range bc.Blocks {
+		if block.IsLegacyBlock(b) {
+			return true, b.Header.Height
+		}
+	}
+	return false, 0
 }

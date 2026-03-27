@@ -8,6 +8,7 @@
 //   - Configurable pool size limit with eviction (oldest first)
 //   - Removal of transactions once they are included in a block
 //   - Querying pending transactions for block assembly
+//   - Double-spend detection based on explicit input outpoints (CRITICAL-2)
 package mempool
 
 import (
@@ -48,11 +49,12 @@ type Entry struct {
 
 // Mempool is a thread-safe pool of unconfirmed transactions.
 type Mempool struct {
-	entries  map[string]*Entry // txID -> entry
-	order    []string          // insertion order (for FIFO priority)
-	maxSize  int
-	sequence int64 // monotonic counter for arrival priority
-	mu       sync.RWMutex
+	entries    map[string]*Entry  // txID -> entry
+	order      []string           // insertion order (for FIFO priority)
+	spentOuts  map[string]string  // outpoint key -> txID that spends it (double-spend tracking)
+	maxSize    int
+	sequence   int64 // monotonic counter for arrival priority
+	mu         sync.RWMutex
 }
 
 // New creates a new mempool with the given maximum size.
@@ -62,9 +64,10 @@ func New(maxSize int) *Mempool {
 		maxSize = DefaultMaxSize
 	}
 	return &Mempool{
-		entries: make(map[string]*Entry),
-		order:   make([]string, 0, 256),
-		maxSize: maxSize,
+		entries:   make(map[string]*Entry),
+		order:     make([]string, 0, 256),
+		spentOuts: make(map[string]string),
+		maxSize:   maxSize,
 	}
 }
 
@@ -74,7 +77,8 @@ func New(maxSize int) *Mempool {
 
 // Add inserts a transaction into the mempool.
 // The transaction must already have a valid ID set.
-// Returns an error if the transaction is a duplicate or the pool is full after eviction.
+// Returns an error if the transaction is a duplicate, spends an already-spent
+// outpoint, or the pool is full after eviction.
 func (mp *Mempool) Add(tx block.Transaction) error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
@@ -86,6 +90,15 @@ func (mp *Mempool) Add(tx block.Transaction) error {
 	// Check for duplicates.
 	if _, exists := mp.entries[tx.ID]; exists {
 		return fmt.Errorf("transaction %s already in mempool", shortID(tx.ID))
+	}
+
+	// Check for double-spend on inputs (CRITICAL-2).
+	for _, in_ := range tx.Inputs {
+		outKey := fmt.Sprintf("%s:%d", in_.PrevTxID, in_.PrevIndex)
+		if existingTxID, exists := mp.spentOuts[outKey]; exists {
+			return fmt.Errorf("double-spend: outpoint %s already spent by mempool tx %s",
+				outKey, shortID(existingTxID))
+		}
 	}
 
 	// Evict expired entries first.
@@ -109,8 +122,19 @@ func (mp *Mempool) Add(tx block.Transaction) error {
 	mp.entries[tx.ID] = entry
 	mp.order = append(mp.order, tx.ID)
 
-	log.Printf("[MEMPOOL] Added TX %s (%s -> %s : %.2f) — pool size: %d",
-		shortID(tx.ID), shortAddr(tx.From), shortAddr(tx.To), tx.Amount, len(mp.entries))
+	// Track spent outpoints.
+	for _, in_ := range tx.Inputs {
+		outKey := fmt.Sprintf("%s:%d", in_.PrevTxID, in_.PrevIndex)
+		mp.spentOuts[outKey] = tx.ID
+	}
+
+	// Build log description.
+	desc := fmt.Sprintf("inputs=%d outputs=%d", len(tx.Inputs), len(tx.Outputs))
+	if tx.IsCoinbase() {
+		desc = "coinbase"
+	}
+	log.Printf("[MEMPOOL] Added TX %s (%s) — pool size: %d",
+		shortID(tx.ID), desc, len(mp.entries))
 
 	return nil
 }
@@ -135,6 +159,14 @@ func (mp *Mempool) RemoveBatch(txIDs []string) {
 
 // removeLocked removes a single TX. Must be called with lock held.
 func (mp *Mempool) removeLocked(txID string) {
+	entry, exists := mp.entries[txID]
+	if exists {
+		// Clean up spent outpoints tracking.
+		for _, in_ := range entry.Tx.Inputs {
+			outKey := fmt.Sprintf("%s:%d", in_.PrevTxID, in_.PrevIndex)
+			delete(mp.spentOuts, outKey)
+		}
+	}
 	delete(mp.entries, txID)
 	// Remove from order slice.
 	for i, id := range mp.order {
@@ -232,34 +264,29 @@ func (mp *Mempool) evictOldestLocked() bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Double-Spend Check (checks if any TX in mempool spends from same sender)
+// Double-Spend Check (CRITICAL-2: based on explicit input outpoints)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// HasSpendFrom returns true if the mempool already contains a transaction
-// from the given sender address. Used for simple double-spend detection.
-func (mp *Mempool) HasSpendFrom(address string) bool {
+// IsOutpointSpent returns true if the given outpoint is already spent by a
+// transaction in the mempool.
+func (mp *Mempool) IsOutpointSpent(txID string, index int) bool {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
-	for _, entry := range mp.entries {
-		if entry.Tx.From == address {
-			return true
-		}
-	}
-	return false
+	outKey := fmt.Sprintf("%s:%d", txID, index)
+	_, exists := mp.spentOuts[outKey]
+	return exists
 }
 
-// GetSpendingTotal returns the total amount being spent by the given address
-// across all pending transactions in the mempool.
+// GetSpendingTotalForAddress returns the total output value of transactions
+// in the mempool that have inputs referencing UTXOs from the given address.
+// This requires checking which inputs belong to the address — callers should
+// pass in the set of outpoint keys that belong to the address.
+// For backward compatibility, this returns 0 — the UTXO-level check is more precise.
 func (mp *Mempool) GetSpendingTotal(address string) float64 {
-	mp.mu.RLock()
-	defer mp.mu.RUnlock()
-	var total float64
-	for _, entry := range mp.entries {
-		if entry.Tx.From == address {
-			total += entry.Tx.Amount
-		}
-	}
-	return total
+	// In the new UTXO model, spending is tracked per-outpoint, not per-address.
+	// This method is kept for backward compatibility but returns 0.
+	// Use IsOutpointSpent for precise double-spend checks.
+	return 0
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

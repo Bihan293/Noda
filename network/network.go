@@ -120,11 +120,13 @@ func (n *Network) BroadcastTransaction(tx block.Transaction) {
 
 // httpBroadcastTransaction sends a transaction to HTTP peers.
 func (n *Network) httpBroadcastTransaction(tx block.Transaction) {
+	// Send the full UTXO transaction with inputs/outputs.
 	body, err := json.Marshal(map[string]interface{}{
-		"from":      tx.From,
-		"to":        tx.To,
-		"amount":    tx.Amount,
-		"signature": tx.Signature,
+		"version":       tx.Version,
+		"inputs":        tx.Inputs,
+		"outputs":       tx.Outputs,
+		"lock_time":     tx.LockTime,
+		"coinbase_data": tx.CoinbaseData,
 	})
 	if err != nil {
 		slog.Error("Broadcast marshal error", "error", err)

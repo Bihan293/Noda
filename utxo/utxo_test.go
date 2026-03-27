@@ -187,16 +187,15 @@ func TestFindUTXOsForAmount_Insufficient(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ApplyBlock
+// ApplyBlock (CRITICAL-2: explicit inputs/outputs)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestApplyBlock_Coinbase(t *testing.T) {
 	s := NewSet()
+	tx := block.NewCoinbaseTx("alice", 1000, 0)
 	b := &block.Block{
-		Header: block.BlockHeader{Height: 0},
-		Transactions: []block.Transaction{
-			{ID: "genesis_tx", From: "", To: "alice", Amount: 1000, Signature: "genesis"},
-		},
+		Header:       block.BlockHeader{Height: 0},
+		Transactions: []block.Transaction{tx},
 	}
 
 	err := s.ApplyBlock(b)
@@ -209,24 +208,51 @@ func TestApplyBlock_Coinbase(t *testing.T) {
 	}
 }
 
+func TestApplyBlock_Genesis(t *testing.T) {
+	s := NewSet()
+	genesis := block.NewGenesisBlock()
+	err := s.ApplyBlock(genesis)
+	if err != nil {
+		t.Fatalf("ApplyBlock(genesis) error: %v", err)
+	}
+	if s.Balance(block.LegacyGenesisAddress) != block.GenesisSupply {
+		t.Errorf("Balance = %f, want %f", s.Balance(block.LegacyGenesisAddress), block.GenesisSupply)
+	}
+}
+
 func TestApplyBlock_Transfer(t *testing.T) {
 	s := NewSet()
 
-	// First apply a coinbase to give alice 100 coins.
-	coinbaseBlock := &block.Block{
-		Header: block.BlockHeader{Height: 0},
-		Transactions: []block.Transaction{
-			{ID: "genesis_tx", From: "", To: "alice", Amount: 100, Signature: "genesis"},
+	// First: give alice 100 coins via a coinbase-like genesis tx.
+	genTx := block.Transaction{
+		Version:      block.TxVersion,
+		Outputs:      []block.TxOutput{{Amount: 100, Address: "alice"}},
+		CoinbaseData: "genesis",
+	}
+	genTx.ID = block.HashTransaction(&genTx)
+
+	genBlock := &block.Block{
+		Header:       block.BlockHeader{Height: 0},
+		Transactions: []block.Transaction{genTx},
+	}
+	s.ApplyBlock(genBlock)
+
+	// Now alice sends 60 to bob with explicit inputs/outputs.
+	transferTx := block.Transaction{
+		Version: block.TxVersion,
+		Inputs: []block.TxInput{
+			{PrevTxID: genTx.ID, PrevIndex: 0, PubKey: "alice", Signature: "sig"},
+		},
+		Outputs: []block.TxOutput{
+			{Amount: 60, Address: "bob"},
+			{Amount: 40, Address: "alice"}, // change
 		},
 	}
-	s.ApplyBlock(coinbaseBlock)
+	transferTx.ID = block.HashTransaction(&transferTx)
 
-	// Now alice sends 60 to bob.
 	transferBlock := &block.Block{
-		Header: block.BlockHeader{Height: 1},
-		Transactions: []block.Transaction{
-			{ID: "tx1", From: "alice", To: "bob", Amount: 60, Signature: "sig"},
-		},
+		Header:       block.BlockHeader{Height: 1},
+		Transactions: []block.Transaction{transferTx},
 	}
 	err := s.ApplyBlock(transferBlock)
 	if err != nil {
@@ -236,26 +262,34 @@ func TestApplyBlock_Transfer(t *testing.T) {
 	if s.Balance("bob") != 60 {
 		t.Errorf("Balance(bob) = %f, want 60", s.Balance("bob"))
 	}
-	// Alice should have 40 change.
 	if s.Balance("alice") != 40 {
 		t.Errorf("Balance(alice) = %f, want 40", s.Balance("alice"))
 	}
 }
 
-func TestApplyBlock_InsufficientFunds(t *testing.T) {
+func TestApplyBlock_MissingInput(t *testing.T) {
 	s := NewSet()
 
-	// Try to spend with no UTXOs.
-	b := &block.Block{
-		Header: block.BlockHeader{Height: 0},
-		Transactions: []block.Transaction{
-			{ID: "tx1", From: "alice", To: "bob", Amount: 100, Signature: "sig"},
+	// Try to spend a non-existent UTXO.
+	tx := block.Transaction{
+		Version: block.TxVersion,
+		Inputs: []block.TxInput{
+			{PrevTxID: "nonexistent_tx", PrevIndex: 0, PubKey: "alice", Signature: "sig"},
 		},
+		Outputs: []block.TxOutput{
+			{Amount: 100, Address: "bob"},
+		},
+	}
+	tx.ID = block.HashTransaction(&tx)
+
+	b := &block.Block{
+		Header:       block.BlockHeader{Height: 0},
+		Transactions: []block.Transaction{tx},
 	}
 
 	err := s.ApplyBlock(b)
 	if err == nil {
-		t.Error("ApplyBlock() should fail with insufficient UTXOs")
+		t.Error("ApplyBlock() should fail with missing input UTXO")
 	}
 }
 

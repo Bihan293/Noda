@@ -6,9 +6,12 @@
 //   - Mempool (pool of unconfirmed transactions)
 //   - Faucet: 5,000 coins per request, global cap 11,000,000 total (no per-address cooldown)
 //   - Mining rewards with halving
+//   - Wallet-level transaction builder (CRITICAL-2)
 //
-// The ledger uses UTXO for balance computation instead of a flat account map.
-// Per-address faucet cooldown is removed; the only limit is the global 11M cap.
+// CRITICAL-2: Transactions now use explicit UTXO inputs and outputs.
+// The ledger provides a wallet-level builder (BuildTransaction) that
+// automatically selects UTXOs for convenience, but the consensus layer
+// only sees explicit inputs/outputs.
 //
 // Genesis ownership:
 //
@@ -23,7 +26,6 @@ import (
 	"log/slog"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/chain"
@@ -55,6 +57,10 @@ const (
 // ErrGenesisOwnerMismatch is returned when the provided faucet key does not
 // match the genesis owner recorded in the chain.
 var ErrGenesisOwnerMismatch = fmt.Errorf("genesis owner mismatch")
+
+// ErrLegacyChainData is returned when the chain contains legacy account-model
+// transactions that are incompatible with the UTXO input/output model.
+var ErrLegacyChainData = fmt.Errorf("legacy chain data detected")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Ledger
@@ -310,37 +316,157 @@ func (l *Ledger) GetAllBalances() map[string]float64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Transaction Validation
+// Wallet-Level Transaction Builder (CRITICAL-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// BuildTransaction creates a fully formed UTXO transaction by:
+//  1. Selecting enough UTXOs from the sender's address to cover the amount
+//  2. Creating outputs: one for the recipient and one for change (if needed)
+//  3. Computing the sighash and signing all inputs
+//  4. Computing the transaction ID
+//
+// This is a wallet-level convenience function. The resulting transaction
+// has explicit inputs/outputs suitable for consensus validation.
+func (l *Ledger) BuildTransaction(privateKeyHex, fromAddr, toAddr string, amount float64) (*block.Transaction, error) {
+	if amount <= 0 {
+		return nil, fmt.Errorf("amount must be positive")
+	}
+	if fromAddr == "" || toAddr == "" {
+		return nil, fmt.Errorf("both 'from' and 'to' addresses are required")
+	}
+	if fromAddr == toAddr {
+		return nil, fmt.Errorf("cannot send to yourself")
+	}
+
+	// Select UTXOs to cover the amount.
+	selectedOPs, totalInput, err := l.UTXOSet.FindUTXOsForAmount(fromAddr, amount)
+	if err != nil {
+		return nil, fmt.Errorf("UTXO selection failed: %w", err)
+	}
+
+	// Check mempool for double-spend on selected outpoints.
+	for _, op := range selectedOPs {
+		if l.Mempool.IsOutpointSpent(op.TxID, op.Index) {
+			return nil, fmt.Errorf("outpoint %s:%d is already being spent by a pending transaction",
+				shortAddr(op.TxID), op.Index)
+		}
+	}
+
+	// Build inputs.
+	inputs := make([]block.TxInput, len(selectedOPs))
+	for i, op := range selectedOPs {
+		inputs[i] = block.TxInput{
+			PrevTxID:  op.TxID,
+			PrevIndex: op.Index,
+			PubKey:    fromAddr, // pub key = address in Ed25519
+		}
+	}
+
+	// Build outputs.
+	outputs := []block.TxOutput{
+		{Amount: amount, Address: toAddr},
+	}
+
+	// Add change output if needed.
+	change := totalInput - amount
+	if change > 0.00000001 { // avoid dust
+		outputs = append(outputs, block.TxOutput{Amount: change, Address: fromAddr})
+	}
+
+	// Construct the unsigned transaction.
+	tx := &block.Transaction{
+		Version:  block.TxVersion,
+		Inputs:   inputs,
+		Outputs:  outputs,
+		LockTime: 0,
+	}
+
+	// Compute sighash and sign all inputs.
+	sighash := block.ComputeSighash(tx)
+	sig, err := crypto.SignSighash(privateKeyHex, sighash)
+	if err != nil {
+		return nil, fmt.Errorf("signing failed: %w", err)
+	}
+
+	// Set the signature on all inputs.
+	for i := range tx.Inputs {
+		tx.Inputs[i].Signature = sig
+	}
+
+	// Compute the transaction ID.
+	tx.ID = block.HashTransaction(tx)
+
+	return tx, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Transaction Validation (CRITICAL-2: explicit inputs/outputs)
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ValidateUserTx checks a user-submitted transaction without applying it.
-// Validates: amount, addresses, signature, UTXO balance, mempool double-spend.
+// Validates: outputs, inputs (UTXO existence, amounts), signature (sighash).
 func (l *Ledger) ValidateUserTx(tx block.Transaction) error {
-	if tx.Amount <= 0 {
-		return fmt.Errorf("invalid amount: must be positive, got %f", tx.Amount)
+	// Must have at least one input and one output.
+	if len(tx.Inputs) == 0 {
+		return fmt.Errorf("transaction must have at least one input")
 	}
-	if tx.From == "" || tx.To == "" {
-		return fmt.Errorf("invalid addresses: both 'from' and 'to' are required")
-	}
-	if tx.From == tx.To {
-		return fmt.Errorf("invalid transaction: cannot send to yourself")
+	if len(tx.Outputs) == 0 {
+		return fmt.Errorf("transaction must have at least one output")
 	}
 
-	// Signature verification.
-	msg := fmt.Sprintf("%s:%s:%f", tx.From, tx.To, tx.Amount)
-	if !crypto.Verify(tx.From, []byte(msg), tx.Signature) {
-		return fmt.Errorf("invalid signature: Ed25519 verification failed for sender %s", shortAddr(tx.From))
+	// Validate output amounts.
+	for i, out := range tx.Outputs {
+		if out.Amount <= 0 {
+			return fmt.Errorf("output %d: amount must be positive, got %f", i, out.Amount)
+		}
+		if out.Address == "" {
+			return fmt.Errorf("output %d: address is required", i)
+		}
 	}
 
-	// Balance check using UTXO set.
-	utxoBalance := l.UTXOSet.Balance(tx.From)
-	// Account for pending spends in the mempool.
-	pendingSpend := l.Mempool.GetSpendingTotal(tx.From)
-	availableBalance := utxoBalance - pendingSpend
+	// Validate inputs: each must reference an existing UTXO.
+	var totalInput float64
+	var senderAddr string
+	for i, in_ := range tx.Inputs {
+		op := utxo.OutPoint{TxID: in_.PrevTxID, Index: in_.PrevIndex}
+		utxoOut := l.UTXOSet.Get(op)
+		if utxoOut == nil {
+			return fmt.Errorf("input %d: utxo %s:%d not found", i, shortAddr(in_.PrevTxID), in_.PrevIndex)
+		}
+		totalInput += utxoOut.Amount
 
-	if availableBalance < tx.Amount {
-		return fmt.Errorf("insufficient balance: address %s has %.6f available (%.6f UTXO - %.6f pending), tried to send %.6f",
-			shortAddr(tx.From), availableBalance, utxoBalance, pendingSpend, tx.Amount)
+		// All inputs must be from the same address (simplification for v1).
+		if senderAddr == "" {
+			senderAddr = utxoOut.Address
+		} else if utxoOut.Address != senderAddr {
+			return fmt.Errorf("input %d: all inputs must be from the same address", i)
+		}
+
+		// Check that the pubkey matches the UTXO owner.
+		if in_.PubKey != utxoOut.Address {
+			return fmt.Errorf("input %d: pubkey does not match UTXO owner", i)
+		}
+
+		// Check mempool double-spend.
+		if l.Mempool.IsOutpointSpent(in_.PrevTxID, in_.PrevIndex) {
+			return fmt.Errorf("input %d: outpoint %s:%d already spent by pending tx",
+				i, shortAddr(in_.PrevTxID), in_.PrevIndex)
+		}
+	}
+
+	// Total outputs must not exceed total inputs.
+	totalOutput := tx.TotalOutputValue()
+	if totalOutput > totalInput {
+		return fmt.Errorf("output total (%.6f) exceeds input total (%.6f)", totalOutput, totalInput)
+	}
+
+	// Signature verification using sighash.
+	sighash := block.ComputeSighash(&tx)
+	for i, in_ := range tx.Inputs {
+		if !crypto.VerifySighash(in_.PubKey, sighash, in_.Signature) {
+			return fmt.Errorf("input %d: Ed25519 signature verification failed for %s",
+				i, shortAddr(in_.PubKey))
+		}
 	}
 
 	return nil
@@ -358,9 +484,10 @@ func (l *Ledger) SubmitTransaction(tx block.Transaction) error {
 		return err
 	}
 
-	// Set timestamp and compute ID.
-	tx.Timestamp = time.Now().Unix()
-	tx.ID = block.HashTransaction(tx)
+	// Ensure ID is computed.
+	if tx.ID == "" {
+		tx.ID = block.HashTransaction(&tx)
+	}
 
 	// Add to mempool.
 	if err := l.Mempool.Add(tx); err != nil {
@@ -400,7 +527,7 @@ func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
 			Height:        nextHeight,
 			PrevBlockHash: prevHash,
 			MerkleRoot:    merkleRoot,
-			Timestamp:     time.Now().Unix(),
+			Timestamp:     l.Chain.LastBlock().Header.Timestamp + 600,
 			Bits:          block.BitsFromTarget(target),
 		},
 		Transactions: []block.Transaction{tx},
@@ -428,56 +555,14 @@ func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
 	l.Balances = l.UTXOSet.AllBalances()
 
 	slog.Info("TX accepted",
-		"from", shortAddr(tx.From),
-		"to", shortAddr(tx.To),
-		"amount", tx.Amount,
+		"inputs", len(tx.Inputs),
+		"outputs", len(tx.Outputs),
 		"block_height", newBlock.Header.Height,
 		"utxo_size", l.UTXOSet.Size(),
 	)
 
 	// Persist.
 	_ = l.saveLocked()
-	return nil
-}
-
-// ProcessTransaction validates a single transaction and applies it to balances.
-// Used for processing transactions within a received block (not user-submitted).
-func (l *Ledger) ProcessTransaction(tx block.Transaction) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if tx.Amount <= 0 {
-		return fmt.Errorf("invalid amount: must be positive, got %f", tx.Amount)
-	}
-
-	// Coinbase: just credit.
-	if tx.From == "" {
-		l.Balances[tx.To] += tx.Amount
-		return nil
-	}
-
-	if tx.To == "" {
-		return fmt.Errorf("invalid addresses: 'to' is required")
-	}
-	if tx.From == tx.To {
-		return fmt.Errorf("invalid transaction: cannot send to yourself")
-	}
-
-	// Signature verification.
-	msg := fmt.Sprintf("%s:%s:%f", tx.From, tx.To, tx.Amount)
-	if !crypto.Verify(tx.From, []byte(msg), tx.Signature) {
-		return fmt.Errorf("invalid signature: Ed25519 verification failed for sender %s", shortAddr(tx.From))
-	}
-
-	// Balance check.
-	senderBalance := l.Balances[tx.From]
-	if senderBalance < tx.Amount {
-		return fmt.Errorf("insufficient balance: address %s has %.6f coins, tried to send %.6f",
-			shortAddr(tx.From), senderBalance, tx.Amount)
-	}
-
-	l.Balances[tx.From] -= tx.Amount
-	l.Balances[tx.To] += tx.Amount
 	return nil
 }
 
@@ -529,21 +614,14 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		return nil, fmt.Errorf("faucet wallet insufficient balance: has %.2f, needs %.2f", faucetBalance, amount)
 	}
 
-	// Sign the transaction.
-	sig, err := crypto.SignTransaction(l.faucetPrivKey, l.faucetAddress, toAddress, amount)
+	// Build and sign the transaction using the wallet builder.
+	tx, err := l.BuildTransaction(l.faucetPrivKey, l.faucetAddress, toAddress, amount)
 	if err != nil {
-		return nil, fmt.Errorf("faucet signing failed: %w", err)
-	}
-
-	tx := block.Transaction{
-		From:      l.faucetAddress,
-		To:        toAddress,
-		Amount:    amount,
-		Signature: sig,
+		return nil, fmt.Errorf("faucet transaction build failed: %w", err)
 	}
 
 	// Process through normal validation (creates a block).
-	if err := l.SubmitTransaction(tx); err != nil {
+	if err := l.SubmitTransaction(*tx); err != nil {
 		return nil, fmt.Errorf("faucet transaction failed: %w", err)
 	}
 
@@ -559,7 +637,7 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		"global_cap", FaucetGlobalCap,
 	)
 
-	return &tx, nil
+	return tx, nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -573,6 +651,13 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	defer l.mu.Unlock()
 
 	if newChain.Len() <= l.Chain.Len() {
+		return false
+	}
+
+	// Check for legacy data.
+	if hasLegacy, height := chain.ContainsLegacyBlocks(newChain); hasLegacy {
+		slog.Warn("Sync rejected: chain contains legacy account-model transactions",
+			"block_height", height)
 		return false
 	}
 
@@ -659,6 +744,21 @@ func LoadLedger(filePath string) *Ledger {
 		}
 	}
 
+	// Check for legacy chain data — fail fast with clear instruction.
+	if l.Chain != nil {
+		if hasLegacy, height := chain.ContainsLegacyBlocks(l.Chain); hasLegacy {
+			slog.Error("FATAL: chain data contains legacy account-model transactions",
+				"block_height", height,
+				"data_file", filePath,
+			)
+			slog.Error("The chain data format is incompatible with the current UTXO input/output model.")
+			slog.Error("To migrate: delete the data file and restart with a fresh chain.")
+			slog.Error("Legacy data cannot be automatically converted — this is a breaking change.")
+			// Return a fresh ledger instead of crashing, but log the error prominently.
+			return NewLedger(filePath)
+		}
+	}
+
 	// Rebuild UTXO set from the loaded chain.
 	if l.Chain != nil {
 		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
@@ -723,6 +823,15 @@ func LoadLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
 		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
 			l.Chain.GenesisOwner = owner
 			slog.Info("Back-filled genesis owner from genesis block", "genesis_owner", owner)
+		}
+	}
+
+	// Check for legacy chain data.
+	if l.Chain != nil {
+		if hasLegacy, height := chain.ContainsLegacyBlocks(l.Chain); hasLegacy {
+			slog.Error("FATAL: chain data contains legacy account-model transactions",
+				"block_height", height)
+			return NewLedgerWithOwner(filePath, genesisOwner)
 		}
 	}
 

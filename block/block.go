@@ -1,6 +1,14 @@
 // Package block implements Bitcoin-like block structures with Proof of Work,
 // Merkle Tree, dynamic difficulty adjustment and halving reward schedule.
 //
+// Transaction model (CRITICAL-2):
+//   - Transactions use explicit UTXO inputs and outputs.
+//   - Each TxInput references a previous transaction output (outpoint).
+//   - Each TxOutput specifies an amount and destination address.
+//   - Coinbase transactions have zero inputs and use IsCoinbase() helper.
+//   - Transaction ID is computed via deterministic binary serialization.
+//   - Signatures cover the sighash of inputs + outputs.
+//
 // Tokenomics:
 //   - Genesis supply: 11,000,000 coins (distributed via faucet)
 //   - Initial block reward: 50 coins
@@ -54,7 +62,11 @@ const (
 	LegacyGenesisAddress = "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
 
 	// BlockVersion is the current block format version.
-	BlockVersion uint32 = 1
+	// Version 2 uses explicit UTXO inputs/outputs transaction model.
+	BlockVersion uint32 = 2
+
+	// TxVersion is the current transaction format version.
+	TxVersion uint32 = 1
 )
 
 // InitialTarget is the starting difficulty target (relatively easy for development).
@@ -69,26 +81,134 @@ func init() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Transaction (carried inside blocks)
+// Transaction: Explicit UTXO Inputs and Outputs (CRITICAL-2)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Transaction represents a single transfer of coins.
-// Coinbase transactions have From="" and Signature="coinbase".
-type Transaction struct {
-	ID        string  `json:"id"`        // SHA-256 hash of content
-	From      string  `json:"from"`      // sender address (empty for coinbase)
-	To        string  `json:"to"`        // receiver address
-	Amount    float64 `json:"amount"`    // coin amount (> 0)
-	Timestamp int64   `json:"timestamp"` // unix timestamp
-	Signature string  `json:"signature"` // hex Ed25519 signature (or "coinbase"/"genesis")
+// TxInput represents a reference to a previous transaction output being spent.
+type TxInput struct {
+	PrevTxID  string `json:"prev_tx_id"`  // hash of the previous transaction
+	PrevIndex int    `json:"prev_index"`  // index of the output in the previous transaction
+	Signature string `json:"signature"`   // hex-encoded Ed25519 signature
+	PubKey    string `json:"pub_key"`     // hex-encoded Ed25519 public key of the signer
 }
 
-// HashTransaction computes the SHA-256 hash of a transaction's content.
-func HashTransaction(tx Transaction) string {
-	record := fmt.Sprintf("%s:%s:%f:%d:%s",
-		tx.From, tx.To, tx.Amount, tx.Timestamp, tx.Signature)
-	h := sha256.Sum256([]byte(record))
+// TxOutput represents a single transaction output.
+type TxOutput struct {
+	Amount  float64 `json:"amount"`  // coin amount (must be > 0)
+	Address string  `json:"address"` // recipient address (hex-encoded public key)
+}
+
+// Transaction represents a transfer of coins using the UTXO model.
+// Coinbase transactions have no inputs (len(Inputs)==0) and a special
+// coinbase marker in the CoinbaseData field.
+//
+// Regular transactions have:
+//   - One or more inputs referencing previous unspent outputs
+//   - One or more outputs specifying recipients and amounts
+//   - The transaction fee = sum(input values) - sum(output values)
+type Transaction struct {
+	ID           string     `json:"id"`            // SHA-256 hash of the serialized tx (excluding signatures)
+	Version      uint32     `json:"version"`       // transaction format version
+	Inputs       []TxInput  `json:"inputs"`        // inputs (empty for coinbase)
+	Outputs      []TxOutput `json:"outputs"`       // outputs
+	LockTime     uint64     `json:"lock_time"`     // minimum block height or timestamp (0 = no lock)
+	CoinbaseData string     `json:"coinbase_data"` // arbitrary data for coinbase txs (empty for regular)
+}
+
+// IsCoinbase returns true if this is a coinbase (mining reward) transaction.
+// Coinbase transactions have no inputs.
+func (tx *Transaction) IsCoinbase() bool {
+	return len(tx.Inputs) == 0 && tx.CoinbaseData != ""
+}
+
+// IsGenesis returns true if this is the genesis (initial supply) transaction.
+func (tx *Transaction) IsGenesis() bool {
+	return len(tx.Inputs) == 0 && tx.CoinbaseData == "genesis"
+}
+
+// TotalOutputValue returns the sum of all output amounts.
+func (tx *Transaction) TotalOutputValue() float64 {
+	var total float64
+	for _, out := range tx.Outputs {
+		total += out.Amount
+	}
+	return total
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deterministic Transaction Serialization & Hashing
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SerializeTxForHash produces a deterministic byte sequence of the transaction
+// for computing its ID. Signatures are EXCLUDED so the ID is stable before/after
+// signing (the ID covers the "structure" of the tx: what is spent and created).
+func SerializeTxForHash(tx *Transaction) []byte {
+	buf := make([]byte, 0, 512)
+
+	// Version (4 bytes LE)
+	vBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(vBuf, tx.Version)
+	buf = append(buf, vBuf...)
+
+	// Number of inputs (4 bytes LE)
+	nIn := make([]byte, 4)
+	binary.LittleEndian.PutUint32(nIn, uint32(len(tx.Inputs)))
+	buf = append(buf, nIn...)
+
+	// Each input: PrevTxID + PrevIndex (signature excluded from hash)
+	for _, in_ := range tx.Inputs {
+		prevBytes, _ := hex.DecodeString(in_.PrevTxID)
+		buf = append(buf, prevBytes...)
+		iBuf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(iBuf, uint32(in_.PrevIndex))
+		buf = append(buf, iBuf...)
+	}
+
+	// Number of outputs (4 bytes LE)
+	nOut := make([]byte, 4)
+	binary.LittleEndian.PutUint32(nOut, uint32(len(tx.Outputs)))
+	buf = append(buf, nOut...)
+
+	// Each output: Amount (8 bytes LE as uint64 satoshi-like) + Address
+	for _, out := range tx.Outputs {
+		aBuf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(aBuf, math.Float64bits(out.Amount))
+		buf = append(buf, aBuf...)
+		addrBytes, _ := hex.DecodeString(out.Address)
+		buf = append(buf, addrBytes...)
+	}
+
+	// LockTime (8 bytes LE)
+	ltBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(ltBuf, tx.LockTime)
+	buf = append(buf, ltBuf...)
+
+	// CoinbaseData (length-prefixed)
+	cbData := []byte(tx.CoinbaseData)
+	cbLen := make([]byte, 4)
+	binary.LittleEndian.PutUint32(cbLen, uint32(len(cbData)))
+	buf = append(buf, cbLen...)
+	buf = append(buf, cbData...)
+
+	return buf
+}
+
+// HashTransaction computes the SHA-256 hash of a transaction's serialized form.
+// This is the canonical transaction ID.
+func HashTransaction(tx *Transaction) string {
+	data := SerializeTxForHash(tx)
+	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
+}
+
+// ComputeSighash computes the hash that must be signed by each input.
+// The sighash covers the full transaction structure (inputs outpoints + all outputs)
+// so the signature commits to exactly what is being spent and created.
+// This is a simplified SIGHASH_ALL equivalent.
+func ComputeSighash(tx *Transaction) []byte {
+	data := SerializeTxForHash(tx)
+	h := sha256.Sum256(data)
+	return h[:]
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -335,15 +455,17 @@ func AdjustDifficulty(currentTarget *big.Int, actualTimeSpan int64) *big.Int {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // NewCoinbaseTx creates a coinbase (mining reward) transaction.
+// Coinbase transactions have no inputs and a single output to the miner.
 func NewCoinbaseTx(minerAddress string, reward float64, height uint64) Transaction {
 	tx := Transaction{
-		From:      "",
-		To:        minerAddress,
-		Amount:    reward,
-		Timestamp: time.Now().Unix(),
-		Signature: fmt.Sprintf("coinbase:%d", height),
+		Version: TxVersion,
+		Inputs:  nil, // coinbase has no inputs
+		Outputs: []TxOutput{
+			{Amount: reward, Address: minerAddress},
+		},
+		CoinbaseData: fmt.Sprintf("coinbase:%d", height),
 	}
-	tx.ID = HashTransaction(tx)
+	tx.ID = HashTransaction(&tx)
 	return tx
 }
 
@@ -365,13 +487,15 @@ func NewGenesisBlock() *Block {
 func NewGenesisBlockWithOwner(ownerAddress string) *Block {
 	// Genesis transaction: mint the entire faucet supply to the owner address.
 	genesisTx := Transaction{
-		From:      "",
-		To:        ownerAddress,
-		Amount:    GenesisSupply,
-		Timestamp: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
-		Signature: "genesis",
+		Version: TxVersion,
+		Inputs:  nil, // genesis has no inputs
+		Outputs: []TxOutput{
+			{Amount: GenesisSupply, Address: ownerAddress},
+		},
+		LockTime:     0,
+		CoinbaseData: "genesis",
 	}
-	genesisTx.ID = HashTransaction(genesisTx)
+	genesisTx.ID = HashTransaction(&genesisTx)
 
 	// Build the genesis block.
 	txIDs := []string{genesisTx.ID}
@@ -405,8 +529,8 @@ func GenesisOwnerFromBlock(b *Block) (string, bool) {
 		return "", false
 	}
 	for _, tx := range b.Transactions {
-		if tx.Signature == "genesis" && tx.From == "" && tx.Amount == GenesisSupply {
-			return tx.To, true
+		if tx.IsGenesis() && len(tx.Outputs) > 0 && tx.Outputs[0].Amount == GenesisSupply {
+			return tx.Outputs[0].Address, true
 		}
 	}
 	return "", false
@@ -483,4 +607,24 @@ func ValidateBlock(b *Block, expectedPrevHash string, expectedHeight uint64) err
 	}
 
 	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Legacy Detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+// IsLegacyTransaction returns true if the block appears to contain legacy
+// account-like transactions (From/To/Amount model without explicit inputs/outputs).
+// This is detected by checking for JSON fields that only exist in legacy format.
+// Used for fail-fast rejection of incompatible chain data.
+func IsLegacyBlock(b *Block) bool {
+	for _, tx := range b.Transactions {
+		// In the new model, non-coinbase transactions MUST have inputs.
+		// Coinbase/genesis have CoinbaseData set.
+		// If a transaction has no inputs AND no CoinbaseData, it's legacy.
+		if len(tx.Inputs) == 0 && tx.CoinbaseData == "" && len(tx.Outputs) > 0 {
+			return true
+		}
+	}
+	return false
 }

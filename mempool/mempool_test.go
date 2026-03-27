@@ -7,14 +7,20 @@ import (
 	"github.com/Bihan293/Noda/block"
 )
 
-func makeTx(id string, from, to string, amount float64) block.Transaction {
+func makeTx(id string, inputs int, outputs int) block.Transaction {
+	ins := make([]block.TxInput, inputs)
+	for i := 0; i < inputs; i++ {
+		ins[i] = block.TxInput{PrevTxID: fmt.Sprintf("prev_%s_%d", id, i), PrevIndex: 0, PubKey: "pk", Signature: "sig"}
+	}
+	outs := make([]block.TxOutput, outputs)
+	for i := 0; i < outputs; i++ {
+		outs[i] = block.TxOutput{Amount: float64(10 + i), Address: fmt.Sprintf("addr_%d", i)}
+	}
 	return block.Transaction{
-		ID:        id,
-		From:      from,
-		To:        to,
-		Amount:    amount,
-		Timestamp: 1000,
-		Signature: "sig",
+		ID:      id,
+		Version: block.TxVersion,
+		Inputs:  ins,
+		Outputs: outs,
 	}
 }
 
@@ -37,7 +43,7 @@ func TestNew_DefaultSize(t *testing.T) {
 
 func TestAdd(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("tx1", "alice", "bob", 50)
+	tx := makeTx("tx1", 1, 1)
 
 	err := mp.Add(tx)
 	if err != nil {
@@ -50,7 +56,7 @@ func TestAdd(t *testing.T) {
 
 func TestAdd_Duplicate(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("tx1", "alice", "bob", 50)
+	tx := makeTx("tx1", 1, 1)
 
 	mp.Add(tx)
 	err := mp.Add(tx)
@@ -61,7 +67,7 @@ func TestAdd_Duplicate(t *testing.T) {
 
 func TestAdd_NoID(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("", "alice", "bob", 50)
+	tx := block.Transaction{ID: "", Version: block.TxVersion}
 
 	err := mp.Add(tx)
 	if err == nil {
@@ -72,26 +78,50 @@ func TestAdd_NoID(t *testing.T) {
 func TestAdd_PoolFull(t *testing.T) {
 	mp := New(2)
 
-	mp.Add(makeTx("tx1", "a", "b", 1))
-	mp.Add(makeTx("tx2", "a", "b", 2))
+	mp.Add(makeTx("tx1", 1, 1))
+	mp.Add(makeTx("tx2", 1, 1))
 
 	// Third should evict the oldest.
-	err := mp.Add(makeTx("tx3", "a", "b", 3))
+	err := mp.Add(makeTx("tx3", 1, 1))
 	if err != nil {
 		t.Fatalf("Add() should evict oldest when full, got error: %v", err)
 	}
 	if mp.Size() != 2 {
 		t.Errorf("Size() = %d after eviction, want 2", mp.Size())
 	}
-	// tx1 should have been evicted.
 	if mp.Has("tx1") {
 		t.Error("tx1 should have been evicted")
 	}
 }
 
+func TestAdd_DoubleSpendOutpoint(t *testing.T) {
+	mp := New(100)
+
+	// Two transactions spending the same outpoint.
+	tx1 := block.Transaction{
+		ID:      "tx1",
+		Version: block.TxVersion,
+		Inputs:  []block.TxInput{{PrevTxID: "prev1", PrevIndex: 0, PubKey: "pk", Signature: "sig"}},
+		Outputs: []block.TxOutput{{Amount: 10, Address: "addr1"}},
+	}
+	tx2 := block.Transaction{
+		ID:      "tx2",
+		Version: block.TxVersion,
+		Inputs:  []block.TxInput{{PrevTxID: "prev1", PrevIndex: 0, PubKey: "pk", Signature: "sig"}},
+		Outputs: []block.TxOutput{{Amount: 10, Address: "addr2"}},
+	}
+
+	if err := mp.Add(tx1); err != nil {
+		t.Fatalf("Add(tx1) error: %v", err)
+	}
+	if err := mp.Add(tx2); err == nil {
+		t.Error("Add(tx2) should fail: double-spend on same outpoint")
+	}
+}
+
 func TestRemove(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("tx1", "alice", "bob", 50)
+	tx := makeTx("tx1", 1, 1)
 	mp.Add(tx)
 
 	mp.Remove("tx1")
@@ -103,11 +133,34 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestRemove_CleansOutpointTracking(t *testing.T) {
+	mp := New(100)
+	tx1 := block.Transaction{
+		ID:      "tx1",
+		Version: block.TxVersion,
+		Inputs:  []block.TxInput{{PrevTxID: "prev1", PrevIndex: 0, PubKey: "pk", Signature: "sig"}},
+		Outputs: []block.TxOutput{{Amount: 10, Address: "addr1"}},
+	}
+	mp.Add(tx1)
+	mp.Remove("tx1")
+
+	// Now the outpoint should be free for another tx.
+	tx2 := block.Transaction{
+		ID:      "tx2",
+		Version: block.TxVersion,
+		Inputs:  []block.TxInput{{PrevTxID: "prev1", PrevIndex: 0, PubKey: "pk", Signature: "sig"}},
+		Outputs: []block.TxOutput{{Amount: 10, Address: "addr2"}},
+	}
+	if err := mp.Add(tx2); err != nil {
+		t.Errorf("Add(tx2) should succeed after tx1 removed: %v", err)
+	}
+}
+
 func TestRemoveBatch(t *testing.T) {
 	mp := New(100)
-	mp.Add(makeTx("tx1", "a", "b", 1))
-	mp.Add(makeTx("tx2", "a", "b", 2))
-	mp.Add(makeTx("tx3", "a", "b", 3))
+	mp.Add(makeTx("tx1", 1, 1))
+	mp.Add(makeTx("tx2", 1, 1))
+	mp.Add(makeTx("tx3", 1, 1))
 
 	mp.RemoveBatch([]string{"tx1", "tx3"})
 	if mp.Size() != 1 {
@@ -120,7 +173,7 @@ func TestRemoveBatch(t *testing.T) {
 
 func TestHas(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("tx1", "alice", "bob", 50)
+	tx := makeTx("tx1", 1, 1)
 	mp.Add(tx)
 
 	if !mp.Has("tx1") {
@@ -133,7 +186,7 @@ func TestHas(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	mp := New(100)
-	tx := makeTx("tx1", "alice", "bob", 50)
+	tx := makeTx("tx1", 1, 1)
 	mp.Add(tx)
 
 	got := mp.Get("tx1")
@@ -152,7 +205,7 @@ func TestGet(t *testing.T) {
 func TestGetPending(t *testing.T) {
 	mp := New(100)
 	for i := 0; i < 5; i++ {
-		mp.Add(makeTx(fmt.Sprintf("tx%d", i), "a", "b", float64(i)))
+		mp.Add(makeTx(fmt.Sprintf("tx%d", i), 1, 1))
 	}
 
 	// Get only 3.
@@ -170,9 +223,9 @@ func TestGetPending(t *testing.T) {
 
 func TestGetPending_FIFO(t *testing.T) {
 	mp := New(100)
-	mp.Add(makeTx("tx1", "a", "b", 1))
-	mp.Add(makeTx("tx2", "a", "b", 2))
-	mp.Add(makeTx("tx3", "a", "b", 3))
+	mp.Add(makeTx("tx1", 1, 1))
+	mp.Add(makeTx("tx2", 1, 1))
+	mp.Add(makeTx("tx3", 1, 1))
 
 	pending := mp.GetPending(2)
 	if pending[0].ID != "tx1" {
@@ -183,37 +236,24 @@ func TestGetPending_FIFO(t *testing.T) {
 	}
 }
 
-func TestHasSpendFrom(t *testing.T) {
+func TestIsOutpointSpent(t *testing.T) {
 	mp := New(100)
-	mp.Add(makeTx("tx1", "alice", "bob", 50))
-
-	if !mp.HasSpendFrom("alice") {
-		t.Error("HasSpendFrom(alice) = false, want true")
+	tx := block.Transaction{
+		ID:      "tx1",
+		Version: block.TxVersion,
+		Inputs:  []block.TxInput{{PrevTxID: "prev1", PrevIndex: 0, PubKey: "pk", Signature: "sig"}},
+		Outputs: []block.TxOutput{{Amount: 10, Address: "addr1"}},
 	}
-	if mp.HasSpendFrom("bob") {
-		t.Error("HasSpendFrom(bob) = true, want false")
+	mp.Add(tx)
+
+	if !mp.IsOutpointSpent("prev1", 0) {
+		t.Error("IsOutpointSpent(prev1:0) = false, want true")
 	}
-}
-
-func TestGetSpendingTotal(t *testing.T) {
-	mp := New(100)
-	mp.Add(makeTx("tx1", "alice", "bob", 30))
-	mp.Add(makeTx("tx2", "alice", "charlie", 20))
-	mp.Add(makeTx("tx3", "bob", "alice", 10))
-
-	total := mp.GetSpendingTotal("alice")
-	if total != 50 {
-		t.Errorf("GetSpendingTotal(alice) = %f, want 50", total)
+	if mp.IsOutpointSpent("prev1", 1) {
+		t.Error("IsOutpointSpent(prev1:1) = true, want false")
 	}
-
-	total = mp.GetSpendingTotal("bob")
-	if total != 10 {
-		t.Errorf("GetSpendingTotal(bob) = %f, want 10", total)
-	}
-
-	total = mp.GetSpendingTotal("unknown")
-	if total != 0 {
-		t.Errorf("GetSpendingTotal(unknown) = %f, want 0", total)
+	if mp.IsOutpointSpent("other", 0) {
+		t.Error("IsOutpointSpent(other:0) = true, want false")
 	}
 }
 

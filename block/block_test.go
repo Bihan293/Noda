@@ -40,16 +40,18 @@ func TestConstants(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// HashTransaction
+// HashTransaction (CRITICAL-2: deterministic binary serialization)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestHashTransaction(t *testing.T) {
-	tx := Transaction{
-		From:      "alice",
-		To:        "bob",
-		Amount:    100,
-		Timestamp: 1000,
-		Signature: "sig",
+	tx := &Transaction{
+		Version: TxVersion,
+		Inputs: []TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0, PubKey: "pk1", Signature: "sig1"},
+		},
+		Outputs: []TxOutput{
+			{Amount: 100, Address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
 	}
 	hash1 := HashTransaction(tx)
 	if hash1 == "" {
@@ -65,11 +67,104 @@ func TestHashTransaction(t *testing.T) {
 		t.Error("HashTransaction() is not deterministic")
 	}
 
-	// Different input must produce different hash.
-	tx.Amount = 200
-	hash3 := HashTransaction(tx)
+	// Different output amount must produce different hash.
+	tx2 := &Transaction{
+		Version: TxVersion,
+		Inputs: []TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0, PubKey: "pk1", Signature: "sig1"},
+		},
+		Outputs: []TxOutput{
+			{Amount: 200, Address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	hash3 := HashTransaction(tx2)
 	if hash1 == hash3 {
 		t.Error("HashTransaction() returned same hash for different input")
+	}
+}
+
+func TestHashTransaction_SignatureExcluded(t *testing.T) {
+	// The hash should be the same regardless of signature value
+	// (signatures are excluded from the hash computation).
+	tx1 := &Transaction{
+		Version: TxVersion,
+		Inputs: []TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0, PubKey: "pk1", Signature: "sig_a"},
+		},
+		Outputs: []TxOutput{
+			{Amount: 100, Address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	tx2 := &Transaction{
+		Version: TxVersion,
+		Inputs: []TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0, PubKey: "pk1", Signature: "sig_b"},
+		},
+		Outputs: []TxOutput{
+			{Amount: 100, Address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	if HashTransaction(tx1) != HashTransaction(tx2) {
+		t.Error("HashTransaction should be the same regardless of signature (signatures excluded)")
+	}
+}
+
+func TestComputeSighash(t *testing.T) {
+	tx := &Transaction{
+		Version: TxVersion,
+		Inputs: []TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0},
+		},
+		Outputs: []TxOutput{
+			{Amount: 50, Address: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	sighash := ComputeSighash(tx)
+	if len(sighash) != 32 {
+		t.Errorf("sighash length = %d, want 32", len(sighash))
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Transaction helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestIsCoinbase(t *testing.T) {
+	cb := Transaction{CoinbaseData: "coinbase:1"}
+	if !cb.IsCoinbase() {
+		t.Error("IsCoinbase() should be true for coinbase tx")
+	}
+
+	regular := Transaction{
+		Inputs:  []TxInput{{PrevTxID: "tx1", PrevIndex: 0}},
+		Outputs: []TxOutput{{Amount: 50, Address: "addr"}},
+	}
+	if regular.IsCoinbase() {
+		t.Error("IsCoinbase() should be false for regular tx")
+	}
+}
+
+func TestIsGenesis(t *testing.T) {
+	gen := Transaction{CoinbaseData: "genesis"}
+	if !gen.IsGenesis() {
+		t.Error("IsGenesis() should be true")
+	}
+
+	cb := Transaction{CoinbaseData: "coinbase:1"}
+	if cb.IsGenesis() {
+		t.Error("IsGenesis() should be false for coinbase")
+	}
+}
+
+func TestTotalOutputValue(t *testing.T) {
+	tx := Transaction{
+		Outputs: []TxOutput{
+			{Amount: 30, Address: "a"},
+			{Amount: 20, Address: "b"},
+		},
+	}
+	if tx.TotalOutputValue() != 50 {
+		t.Errorf("TotalOutputValue() = %f, want 50", tx.TotalOutputValue())
 	}
 }
 
@@ -136,7 +231,7 @@ func TestComputeMerkleRoot_Deterministic(t *testing.T) {
 
 func TestHashBlockHeader_Deterministic(t *testing.T) {
 	h := BlockHeader{
-		Version:       1,
+		Version:       2,
 		Height:        5,
 		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		MerkleRoot:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -170,30 +265,20 @@ func TestMeetsTarget(t *testing.T) {
 	target := new(big.Int)
 	target.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 
-	// Hash well below target.
 	if !MeetsTarget("0000000000000000000000000000000000000000000000000000000000000001", target) {
 		t.Error("MeetsTarget() should return true for hash below target")
 	}
 
-	// Hash above target.
 	if MeetsTarget("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", target) {
 		t.Error("MeetsTarget() should return false for hash above target")
 	}
 }
 
 func TestMineBlock(t *testing.T) {
-	// Use a very easy target for fast mining in tests.
 	easyTarget := new(big.Int)
 	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
 
-	tx := Transaction{
-		From:      "",
-		To:        "miner",
-		Amount:    50,
-		Timestamp: time.Now().Unix(),
-		Signature: "coinbase:1",
-	}
-	tx.ID = HashTransaction(tx)
+	tx := NewCoinbaseTx("miner", 50, 1)
 
 	b := &Block{
 		Header: BlockHeader{
@@ -219,18 +304,18 @@ func TestMineBlock(t *testing.T) {
 }
 
 func TestMineBlock_ExhaustedAttempts(t *testing.T) {
-	// Impossible target.
 	impossibleTarget := big.NewInt(0)
 
+	tx := NewCoinbaseTx("miner", 50, 1)
 	b := &Block{
 		Header: BlockHeader{
 			Version:       BlockVersion,
 			Height:        1,
 			PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
-			MerkleRoot:    "aaaa",
+			MerkleRoot:    ComputeMerkleRoot([]string{tx.ID}),
 			Timestamp:     time.Now().Unix(),
 		},
-		Transactions: []Transaction{{ID: "tx1"}},
+		Transactions: []Transaction{tx},
 	}
 
 	err := MineBlock(b, impossibleTarget, 10)
@@ -265,7 +350,6 @@ func TestBlockReward_SecondHalving(t *testing.T) {
 }
 
 func TestBlockReward_CapExceeded(t *testing.T) {
-	// Already mined all 10M.
 	reward := BlockReward(1, MaxMiningSupply)
 	if reward != 0 {
 		t.Errorf("BlockReward with full supply = %f, want 0", reward)
@@ -273,7 +357,6 @@ func TestBlockReward_CapExceeded(t *testing.T) {
 }
 
 func TestBlockReward_PartialRemaining(t *testing.T) {
-	// Only 10 coins remaining.
 	reward := BlockReward(1, MaxMiningSupply-10)
 	if reward != 10 {
 		t.Errorf("BlockReward with 10 remaining = %f, want 10", reward)
@@ -292,9 +375,8 @@ func TestBlockReward_ManyHalvings(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestAdjustDifficulty_TooFast(t *testing.T) {
-	// Blocks too fast → lower target (harder difficulty).
 	expectedSpan := int64(DifficultyAdjustmentInterval) * int64(TargetBlockTime.Seconds())
-	actualSpan := expectedSpan / 2 // twice as fast
+	actualSpan := expectedSpan / 2
 
 	newTarget := AdjustDifficulty(InitialTarget, actualSpan)
 
@@ -304,9 +386,8 @@ func TestAdjustDifficulty_TooFast(t *testing.T) {
 }
 
 func TestAdjustDifficulty_TooSlow(t *testing.T) {
-	// Blocks too slow → higher target (easier difficulty).
 	expectedSpan := int64(DifficultyAdjustmentInterval) * int64(TargetBlockTime.Seconds())
-	actualSpan := expectedSpan * 2 // twice as slow
+	actualSpan := expectedSpan * 2
 
 	currentTarget := new(big.Int).Div(InitialTarget, big.NewInt(10))
 	newTarget := AdjustDifficulty(currentTarget, actualSpan)
@@ -317,9 +398,8 @@ func TestAdjustDifficulty_TooSlow(t *testing.T) {
 }
 
 func TestAdjustDifficulty_ClampedMax(t *testing.T) {
-	// Extremely slow blocks → clamped to 4x.
 	expectedSpan := int64(DifficultyAdjustmentInterval) * int64(TargetBlockTime.Seconds())
-	actualSpan := expectedSpan * 100 // way too slow
+	actualSpan := expectedSpan * 100
 
 	currentTarget := new(big.Int).Div(InitialTarget, big.NewInt(100))
 	newTarget := AdjustDifficulty(currentTarget, actualSpan)
@@ -331,7 +411,6 @@ func TestAdjustDifficulty_ClampedMax(t *testing.T) {
 }
 
 func TestAdjustDifficulty_NeverExceedsInitial(t *testing.T) {
-	// Even with very slow blocks, target should not exceed InitialTarget.
 	expectedSpan := int64(DifficultyAdjustmentInterval) * int64(TargetBlockTime.Seconds())
 	actualSpan := expectedSpan * 100
 
@@ -343,24 +422,30 @@ func TestAdjustDifficulty_NeverExceedsInitial(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Coinbase Transaction
+// Coinbase Transaction (CRITICAL-2: UTXO model)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestNewCoinbaseTx(t *testing.T) {
 	tx := NewCoinbaseTx("miner_address", 50, 10)
 
-	if tx.From != "" {
-		t.Errorf("coinbase From = %q, want empty", tx.From)
+	if !tx.IsCoinbase() {
+		t.Error("NewCoinbaseTx should create a coinbase transaction")
 	}
-	if tx.To != "miner_address" {
-		t.Errorf("coinbase To = %q, want miner_address", tx.To)
+	if len(tx.Inputs) != 0 {
+		t.Errorf("coinbase Inputs = %d, want 0", len(tx.Inputs))
 	}
-	if tx.Amount != 50 {
-		t.Errorf("coinbase Amount = %f, want 50", tx.Amount)
+	if len(tx.Outputs) != 1 {
+		t.Fatalf("coinbase Outputs = %d, want 1", len(tx.Outputs))
 	}
-	expectedSig := fmt.Sprintf("coinbase:%d", 10)
-	if tx.Signature != expectedSig {
-		t.Errorf("coinbase Signature = %q, want %q", tx.Signature, expectedSig)
+	if tx.Outputs[0].Address != "miner_address" {
+		t.Errorf("coinbase output address = %q, want miner_address", tx.Outputs[0].Address)
+	}
+	if tx.Outputs[0].Amount != 50 {
+		t.Errorf("coinbase output amount = %f, want 50", tx.Outputs[0].Amount)
+	}
+	expectedData := fmt.Sprintf("coinbase:%d", 10)
+	if tx.CoinbaseData != expectedData {
+		t.Errorf("CoinbaseData = %q, want %q", tx.CoinbaseData, expectedData)
 	}
 	if tx.ID == "" {
 		t.Error("coinbase ID is empty")
@@ -389,14 +474,18 @@ func TestNewGenesisBlock(t *testing.T) {
 	if len(genesis.Transactions) != 1 {
 		t.Errorf("genesis TX count = %d, want 1", len(genesis.Transactions))
 	}
-	if genesis.Transactions[0].Amount != GenesisSupply {
-		t.Errorf("genesis TX amount = %f, want %f", genesis.Transactions[0].Amount, GenesisSupply)
+	genTx := genesis.Transactions[0]
+	if !genTx.IsGenesis() {
+		t.Error("genesis tx should be identified as genesis")
 	}
-	if genesis.Transactions[0].To != LegacyGenesisAddress {
-		t.Errorf("genesis TX to = %s, want %s", genesis.Transactions[0].To, LegacyGenesisAddress)
+	if len(genTx.Outputs) != 1 {
+		t.Fatalf("genesis TX output count = %d, want 1", len(genTx.Outputs))
 	}
-	if genesis.Transactions[0].Signature != "genesis" {
-		t.Errorf("genesis TX signature = %q, want %q", genesis.Transactions[0].Signature, "genesis")
+	if genTx.Outputs[0].Amount != GenesisSupply {
+		t.Errorf("genesis TX amount = %f, want %f", genTx.Outputs[0].Amount, GenesisSupply)
+	}
+	if genTx.Outputs[0].Address != LegacyGenesisAddress {
+		t.Errorf("genesis TX address = %s, want %s", genTx.Outputs[0].Address, LegacyGenesisAddress)
 	}
 }
 
@@ -499,14 +588,13 @@ func TestNewGenesisBlockWithOwner(t *testing.T) {
 	if genesis.Header.Height != 0 {
 		t.Errorf("genesis height = %d, want 0", genesis.Header.Height)
 	}
-	if genesis.Transactions[0].To != customAddr {
-		t.Errorf("genesis TX to = %s, want %s", genesis.Transactions[0].To, customAddr)
+	if genesis.Transactions[0].Outputs[0].Address != customAddr {
+		t.Errorf("genesis TX address = %s, want %s", genesis.Transactions[0].Outputs[0].Address, customAddr)
 	}
-	if genesis.Transactions[0].Amount != GenesisSupply {
-		t.Errorf("genesis TX amount = %f, want %f", genesis.Transactions[0].Amount, GenesisSupply)
+	if genesis.Transactions[0].Outputs[0].Amount != GenesisSupply {
+		t.Errorf("genesis TX amount = %f, want %f", genesis.Transactions[0].Outputs[0].Amount, GenesisSupply)
 	}
 
-	// Different owner should produce different genesis hash.
 	legacyGenesis := NewGenesisBlock()
 	if genesis.Hash == legacyGenesis.Hash {
 		t.Error("custom genesis should have different hash from legacy genesis")
@@ -565,5 +653,16 @@ func TestGenesisOwnerFromBlock_NonGenesis(t *testing.T) {
 	_, ok := GenesisOwnerFromBlock(b)
 	if ok {
 		t.Error("GenesisOwnerFromBlock() should return false for non-genesis block")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// [CRITICAL-2] Legacy Detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestIsLegacyBlock_NewFormat(t *testing.T) {
+	genesis := NewGenesisBlock()
+	if IsLegacyBlock(genesis) {
+		t.Error("genesis block should not be detected as legacy")
 	}
 }

@@ -4,6 +4,10 @@
 // identified by a composite key (txID + output index). When a transaction
 // consumes an output, it is marked as spent and removed from the set.
 //
+// CRITICAL-2: Transactions now carry explicit inputs and outputs.
+// ApplyBlock spends exactly the outpoints listed in each transaction's inputs
+// and creates new outputs as listed in the transaction's outputs.
+//
 // The UTXO model enables:
 //   - Efficient balance lookups (sum of unspent outputs for an address)
 //   - Double-spend detection (an output can only be spent once)
@@ -216,84 +220,55 @@ func (s *Set) Size() int {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Block Processing — Apply / Rollback
+// Block Processing — Apply / Rollback (CRITICAL-2: explicit inputs/outputs)
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ApplyBlock processes all transactions in a block, updating the UTXO set.
 // For each transaction:
-//   - Coinbase/genesis (From==""): only creates outputs, no inputs to consume
-//   - Regular: spends the sender's outputs and creates new outputs
+//   - Coinbase/genesis (IsCoinbase()/IsGenesis()): only creates outputs, no inputs to consume
+//   - Regular: spends exactly the outpoints listed in tx.Inputs and creates tx.Outputs
 //
-// In our current account-like transaction model (single From→To with amount),
-// each transaction produces one output to the recipient. If change is needed
-// (sender had more than the amount), it creates a change output back to sender.
-//
-// For simplicity in this stage, we treat each transaction as consuming all UTXOs
-// from the sender that are needed to cover the amount, and producing:
-//   1. An output for the recipient (amount)
-//   2. A change output for the sender (if any)
+// This is the CRITICAL-2 model: no more searching for "sender UTXOs by address".
+// Each transaction explicitly declares which outputs it spends via its Inputs.
 func (s *Set) ApplyBlock(b *block.Block) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for i, tx := range b.Transactions {
-		if tx.From == "" {
-			// Coinbase / genesis transaction: create output for recipient.
-			op := OutPoint{TxID: tx.ID, Index: 0}
-			s.utxos[op.Key()] = &utxoEntry{
-				OutPoint: op,
-				Output: Output{
-					Address: tx.To,
-					Amount:  tx.Amount,
-				},
+		if tx.IsCoinbase() || tx.IsGenesis() {
+			// Coinbase / genesis transaction: create outputs only.
+			for j, out := range tx.Outputs {
+				op := OutPoint{TxID: tx.ID, Index: j}
+				s.utxos[op.Key()] = &utxoEntry{
+					OutPoint: op,
+					Output: Output{
+						Address: out.Address,
+						Amount:  out.Amount,
+					},
+				}
 			}
 			continue
 		}
 
-		// Regular transaction: find and consume sender's UTXOs.
-		// Collect enough UTXOs from sender to cover the amount.
-		var senderUTXOs []string // keys
-		var senderTotal float64
-
-		for key, entry := range s.utxos {
-			if entry.Output.Address == tx.From {
-				senderUTXOs = append(senderUTXOs, key)
-				senderTotal += entry.Output.Amount
-				if senderTotal >= tx.Amount {
-					break
-				}
+		// Regular transaction: spend explicitly referenced inputs.
+		for _, in_ := range tx.Inputs {
+			op := OutPoint{TxID: in_.PrevTxID, Index: in_.PrevIndex}
+			key := op.Key()
+			if _, exists := s.utxos[key]; !exists {
+				return fmt.Errorf("block %d, tx %d: utxo not found %s (double-spend or missing input)",
+					b.Header.Height, i, key)
 			}
-		}
-
-		if senderTotal < tx.Amount {
-			return fmt.Errorf("block %d, tx %d: insufficient UTXOs for %s (has %.6f, needs %.6f)",
-				b.Header.Height, i, shortAddr(tx.From), senderTotal, tx.Amount)
-		}
-
-		// Remove consumed UTXOs.
-		for _, key := range senderUTXOs {
 			delete(s.utxos, key)
 		}
 
-		// Create output for recipient.
-		outRecipient := OutPoint{TxID: tx.ID, Index: 0}
-		s.utxos[outRecipient.Key()] = &utxoEntry{
-			OutPoint: outRecipient,
-			Output: Output{
-				Address: tx.To,
-				Amount:  tx.Amount,
-			},
-		}
-
-		// Create change output for sender (if needed).
-		change := senderTotal - tx.Amount
-		if change > 0.00000001 { // avoid dust
-			outChange := OutPoint{TxID: tx.ID, Index: 1}
-			s.utxos[outChange.Key()] = &utxoEntry{
-				OutPoint: outChange,
+		// Create outputs.
+		for j, out := range tx.Outputs {
+			op := OutPoint{TxID: tx.ID, Index: j}
+			s.utxos[op.Key()] = &utxoEntry{
+				OutPoint: op,
 				Output: Output{
-					Address: tx.From,
-					Amount:  change,
+					Address: out.Address,
+					Amount:  out.Amount,
 				},
 			}
 		}

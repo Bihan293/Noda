@@ -5,10 +5,10 @@
 //   - Chain validation and serialization round-trips
 //   - Tokenomics enforcement (faucet cap, mining cap)
 //   - UTXO consistency across operations
+//   - CRITICAL-2: explicit UTXO inputs/outputs in transactions
 package integration
 
 import (
-	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -112,7 +112,6 @@ func TestChainSerializationRoundTrip(t *testing.T) {
 		t.Fatalf("FromJSON() error: %v", err)
 	}
 
-	// Compare.
 	if bc2.Len() != bc.Len() {
 		t.Errorf("deserialized Len() = %d, want %d", bc2.Len(), bc.Len())
 	}
@@ -123,7 +122,6 @@ func TestChainSerializationRoundTrip(t *testing.T) {
 		t.Errorf("deserialized TotalMined = %f, want %f", bc2.TotalMined, bc.TotalMined)
 	}
 
-	// Validate deserialized chain.
 	if err := chain.ValidateChain(bc2); err != nil {
 		t.Errorf("ValidateChain(deserialized) error: %v", err)
 	}
@@ -134,7 +132,6 @@ func TestChainSerializationRoundTrip(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestUTXOConsistency(t *testing.T) {
-	// Build a chain with genesis + 2 mined blocks.
 	genesis := block.NewGenesisBlock()
 	blocks := []*block.Block{genesis}
 
@@ -163,13 +160,11 @@ func TestUTXOConsistency(t *testing.T) {
 		t.Fatalf("RebuildFromBlocks() error: %v", err)
 	}
 
-	// Genesis address should have 11M.
 	genesisBalance := utxoSet.Balance(block.LegacyGenesisAddress)
 	if genesisBalance != block.GenesisSupply {
 		t.Errorf("genesis balance = %f, want %f", genesisBalance, block.GenesisSupply)
 	}
 
-	// Miner should have 50.
 	minerBalance := utxoSet.Balance("miner")
 	if minerBalance != 50 {
 		t.Errorf("miner balance = %f, want 50", minerBalance)
@@ -177,11 +172,10 @@ func TestUTXOConsistency(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// End-to-End: Crypto Sign + Verify
+// End-to-End: Crypto Sign + Verify (CRITICAL-2: sighash model)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestSignVerifyIntegration(t *testing.T) {
-	// Generate key pair.
 	kp, err := crypto.GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)
@@ -191,16 +185,27 @@ func TestSignVerifyIntegration(t *testing.T) {
 	to := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	amount := 42.5
 
-	// Sign a transaction.
-	sig, err := crypto.SignTransaction(privHex, kp.Address, to, amount)
+	// Build a transaction to sign.
+	tx := &block.Transaction{
+		Version: block.TxVersion,
+		Inputs: []block.TxInput{
+			{PrevTxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrevIndex: 0, PubKey: kp.Address},
+		},
+		Outputs: []block.TxOutput{
+			{Amount: amount, Address: to},
+		},
+	}
+
+	// Compute sighash and sign.
+	sighash := block.ComputeSighash(tx)
+	sig, err := crypto.SignSighash(privHex, sighash)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify using the same message format as the ledger.
-	msg := fmt.Sprintf("%s:%s:%f", kp.Address, to, amount)
-	if !crypto.Verify(kp.Address, []byte(msg), sig) {
-		t.Error("signature verification failed")
+	// Verify using sighash.
+	if !crypto.VerifySighash(kp.Address, sighash, sig) {
+		t.Error("sighash signature verification failed")
 	}
 
 	// Derive address from private key.
@@ -214,21 +219,22 @@ func TestSignVerifyIntegration(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// End-to-End: Mempool + Block Confirmation
+// End-to-End: Mempool + Block Confirmation (CRITICAL-2)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestMempoolBlockConfirmation(t *testing.T) {
 	mp := mempool.New(100)
 
-	// Add 3 transactions.
 	for i := 0; i < 3; i++ {
 		tx := block.Transaction{
-			ID:        fmt.Sprintf("tx%d", i),
-			From:      "alice",
-			To:        "bob",
-			Amount:    float64(10 + i),
-			Timestamp: time.Now().Unix(),
-			Signature: "sig",
+			ID:      fmt.Sprintf("tx%d", i),
+			Version: block.TxVersion,
+			Inputs: []block.TxInput{
+				{PrevTxID: fmt.Sprintf("prev_%d", i), PrevIndex: 0, PubKey: "pk", Signature: "sig"},
+			},
+			Outputs: []block.TxOutput{
+				{Amount: float64(10 + i), Address: "recipient"},
+			},
 		}
 		mp.Add(tx)
 	}
@@ -237,7 +243,6 @@ func TestMempoolBlockConfirmation(t *testing.T) {
 		t.Errorf("mempool size = %d, want 3", mp.Size())
 	}
 
-	// Simulate block confirmation — remove confirmed TXs.
 	mp.RemoveBatch([]string{"tx0", "tx2"})
 
 	if mp.Size() != 1 {
@@ -253,7 +258,6 @@ func TestMempoolBlockConfirmation(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestFaucetConstants(t *testing.T) {
-	// Verify faucet constants match the tokenomics.
 	if ledger.FaucetAmount != 5000 {
 		t.Errorf("FaucetAmount = %f, want 5000", ledger.FaucetAmount)
 	}
@@ -272,19 +276,16 @@ func TestFaucetConstants(t *testing.T) {
 func TestLedgerPersistence(t *testing.T) {
 	path := tmpFile(t)
 
-	// Create and save.
 	l1 := ledger.NewLedger(path)
 	if err := l1.Save(); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
 
-	// Load.
 	l2 := ledger.LoadLedger(path)
 	if l2.GetChainHeight() != l1.GetChainHeight() {
 		t.Errorf("loaded height = %d, want %d", l2.GetChainHeight(), l1.GetChainHeight())
 	}
 
-	// Balances should match.
 	b1 := l1.GetBalance(block.LegacyGenesisAddress)
 	b2 := l2.GetBalance(block.LegacyGenesisAddress)
 	if b1 != b2 {
@@ -297,30 +298,24 @@ func TestLedgerPersistence(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestTokenomics(t *testing.T) {
-	// 1. Total supply = Genesis + Mining = 21M.
 	if block.GenesisSupply+block.MaxMiningSupply != block.MaxTotalSupply {
 		t.Errorf("Genesis(%f) + Mining(%f) != Total(%f)",
 			block.GenesisSupply, block.MaxMiningSupply, block.MaxTotalSupply)
 	}
 
-	// 2. Faucet cap = Genesis supply = 11M.
 	if ledger.FaucetGlobalCap != block.GenesisSupply {
 		t.Errorf("FaucetGlobalCap(%f) != GenesisSupply(%f)",
 			ledger.FaucetGlobalCap, block.GenesisSupply)
 	}
 
-	// 3. Initial block reward = 50.
 	if block.InitialBlockReward != 50 {
 		t.Errorf("InitialBlockReward = %f, want 50", block.InitialBlockReward)
 	}
 
-	// 4. Halving interval = 210000.
 	if block.HalvingInterval != 210_000 {
 		t.Errorf("HalvingInterval = %d, want 210000", block.HalvingInterval)
 	}
 
-	// 5. Mining rewards sum test (verify first few eras).
-	// Era 0: 210000 * 50 = 10,500,000 (but capped at 10M).
 	totalMiningRewards := 0.0
 	for h := uint64(0); h < 10*block.HalvingInterval; h++ {
 		reward := block.BlockReward(h, totalMiningRewards)
@@ -329,58 +324,111 @@ func TestTokenomics(t *testing.T) {
 		}
 		totalMiningRewards += reward
 	}
-	// Mining rewards should approach 10M.
 	if totalMiningRewards > block.MaxMiningSupply {
 		t.Errorf("total mining rewards = %f, exceeds %f", totalMiningRewards, block.MaxMiningSupply)
 	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// End-to-End: Full Transaction Flow
+// End-to-End: Full Transaction Flow (CRITICAL-2: wallet builder + UTXO)
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestFullTransactionFlow(t *testing.T) {
-	l := ledger.NewLedger(tmpFile(t))
-
-	// Generate keys for sender (use genesis address for simplicity, we sign with a test key).
-	pub, priv, err := ed25519.GenerateKey(nil)
+	kp, err := crypto.GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sender := hex.EncodeToString(pub)
-	privHex := hex.EncodeToString(priv)
+	privHex := hex.EncodeToString(kp.PrivateKey)
 
-	// Fund the sender by creating a UTXO manually.
-	fundOp := utxo.OutPoint{TxID: "fund_tx", Index: 0}
-	fundOut := utxo.Output{Address: sender, Amount: 1000}
-	l.UTXOSet.Add(fundOp, fundOut)
+	// Create a ledger with this key as genesis owner.
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
 
 	// Create recipient.
 	recvKP, _ := crypto.GenerateKeyPair()
 	receiver := recvKP.Address
 
-	// Sign a transaction.
+	// Build a transaction using the wallet builder.
 	amount := 100.0
-	sig, err := crypto.SignTransaction(privHex, sender, receiver, amount)
+	tx, err := l.BuildTransaction(privHex, kp.Address, receiver, amount)
 	if err != nil {
-		t.Fatalf("SignTransaction() error: %v", err)
+		t.Fatalf("BuildTransaction() error: %v", err)
 	}
 
-	// Verify the signature.
-	msg := fmt.Sprintf("%s:%s:%f", sender, receiver, amount)
-	if !crypto.Verify(sender, []byte(msg), sig) {
-		t.Error("Verify() failed for valid signature")
+	// Verify the transaction is well-formed.
+	if len(tx.Inputs) == 0 {
+		t.Error("tx should have inputs")
+	}
+	if len(tx.Outputs) < 1 {
+		t.Error("tx should have at least one output")
+	}
+	if tx.ID == "" {
+		t.Error("tx ID should be set")
 	}
 
-	// Validate the transaction through the ledger.
-	tx := block.Transaction{
-		From:      sender,
-		To:        receiver,
-		Amount:    amount,
-		Signature: sig,
-	}
-	err = l.ValidateUserTx(tx)
+	// Validate through ledger.
+	err = l.ValidateUserTx(*tx)
 	if err != nil {
 		t.Fatalf("ValidateUserTx() error: %v", err)
 	}
+
+	// Submit (which mines a block).
+	err = l.SubmitTransaction(*tx)
+	if err != nil {
+		t.Fatalf("SubmitTransaction() error: %v", err)
+	}
+
+	// Verify balances.
+	receiverBalance := l.GetBalance(receiver)
+	if receiverBalance != amount {
+		t.Errorf("receiver balance = %f, want %f", receiverBalance, amount)
+	}
+
+	senderBalance := l.GetBalance(kp.Address)
+	expectedChange := block.GenesisSupply - amount
+	if senderBalance != expectedChange {
+		t.Errorf("sender balance = %f, want %f", senderBalance, expectedChange)
+	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-2: Verify no From/To/Amount in consensus blocks
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestNoLegacyFieldsInBlocks(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatal(err)
+	}
+
+	recvKP, _ := crypto.GenerateKeyPair()
+	_, err = l.ProcessFaucet(recvKP.Address)
+	if err != nil {
+		t.Fatalf("ProcessFaucet() error: %v", err)
+	}
+
+	// Inspect all transactions in all blocks.
+	bc := l.GetChain()
+	for _, b := range bc.Blocks {
+		for _, tx := range b.Transactions {
+			// Every tx must have explicit outputs.
+			if len(tx.Outputs) == 0 {
+				t.Errorf("block %d: tx %s has no outputs", b.Header.Height, tx.ID[:8])
+			}
+			// Non-coinbase txs must have explicit inputs.
+			if !tx.IsCoinbase() && !tx.IsGenesis() {
+				if len(tx.Inputs) == 0 {
+					t.Errorf("block %d: regular tx %s has no inputs", b.Header.Height, tx.ID[:8])
+				}
+			}
+		}
+	}
+}
+
+// Suppress unused import warnings.
+var _ = time.Now

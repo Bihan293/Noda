@@ -1,16 +1,10 @@
 // Package api provides the HTTP server with JSON endpoints for interacting
 // with the cryptocurrency node.
 //
-// Production features:
-//   - UTXO-based balance queries
-//   - Mempool status and pending transactions
-//   - Faucet with global 11M cap (no per-address cooldown)
-//   - Block-based chain with PoW, halving
-//   - Structured logging via log/slog
-//   - Prometheus-compatible /metrics endpoint
-//   - Rate limiting per IP
-//   - Graceful shutdown with context
-//   - Input validation and security headers
+// CRITICAL-2: Transactions now use explicit UTXO inputs/outputs.
+// - POST /transaction accepts raw signed transactions with explicit inputs/outputs
+// - POST /send uses the wallet-level builder to auto-select UTXOs
+// - POST /sign signs a transaction using the wallet-level builder
 package api
 
 import (
@@ -81,12 +75,14 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 // ---------- Request / Response types ----------
 
-// TransactionRequest is the JSON body for POST /transaction.
-type TransactionRequest struct {
-	From      string  `json:"from"`
-	To        string  `json:"to"`
-	Amount    float64 `json:"amount"`
-	Signature string  `json:"signature"`
+// RawTransactionRequest is the JSON body for POST /transaction.
+// Accepts a fully formed transaction with explicit inputs/outputs.
+type RawTransactionRequest struct {
+	Version      uint32          `json:"version"`
+	Inputs       []block.TxInput  `json:"inputs"`
+	Outputs      []block.TxOutput `json:"outputs"`
+	LockTime     uint64          `json:"lock_time"`
+	CoinbaseData string          `json:"coinbase_data"`
 }
 
 // SendRequest is the JSON body for POST /sign and POST /send.
@@ -152,9 +148,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]string{
-		"status": "ok",
-		"node":   "noda",
-		"version": "0.5.0",
+		"status":  "ok",
+		"node":    "noda",
+		"version": "0.6.0",
 	})
 }
 
@@ -171,18 +167,15 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	balance := s.Ledger.GetBalance(addr)
-	pendingSpend := s.Ledger.Mempool.GetSpendingTotal(addr)
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"address":       addr,
-		"balance":       balance,
-		"pending_spend": pendingSpend,
-		"available":     balance - pendingSpend,
-		"utxo_count":    len(s.Ledger.UTXOSet.GetUTXOsForAddress(addr)),
+		"address":    addr,
+		"balance":    balance,
+		"utxo_count": len(s.Ledger.UTXOSet.GetUTXOsForAddress(addr)),
 	})
 }
 
-// handleTransaction processes a pre-signed transaction.
-// POST /transaction — body: {from, to, amount, signature}
+// handleTransaction processes a pre-signed raw UTXO transaction.
+// POST /transaction — body: {version, inputs, outputs, lock_time}
 func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -190,35 +183,24 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-	var req TransactionRequest
+	var req RawTransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		slog.Warn("TX decode failed", "error", err)
 		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
-	// Input validation.
-	if err := validateAddress(req.From); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid 'from': "+err.Error())
-		return
-	}
-	if err := validateAddress(req.To); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid 'to': "+err.Error())
-		return
-	}
-	if len(req.Signature) > maxSignatureLen || !validateHex(req.Signature) {
-		errorResponse(w, http.StatusBadRequest, "invalid signature format")
-		return
-	}
-
-	slog.Info("TX received", "from", shortAddr(req.From), "to", shortAddr(req.To), "amount", req.Amount)
-
+	// Build the transaction.
 	tx := block.Transaction{
-		From:      req.From,
-		To:        req.To,
-		Amount:    req.Amount,
-		Signature: req.Signature,
+		Version:      req.Version,
+		Inputs:       req.Inputs,
+		Outputs:      req.Outputs,
+		LockTime:     req.LockTime,
+		CoinbaseData: req.CoinbaseData,
 	}
+	tx.ID = block.HashTransaction(&tx)
+
+	slog.Info("TX received", "inputs", len(tx.Inputs), "outputs", len(tx.Outputs))
 
 	if err := s.Ledger.SubmitTransaction(tx); err != nil {
 		m.TxRejected.Inc()
@@ -234,7 +216,7 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 
 	jsonResponse(w, http.StatusCreated, map[string]string{
 		"message": "transaction accepted",
-		"id":      s.Ledger.GetChain().LastHash(),
+		"txid":    tx.ID,
 	})
 }
 
@@ -333,7 +315,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
 		"port":                  s.Port,
-		"version":               "0.5.0",
+		"version":               "0.6.0",
+		"tx_model":              "utxo_inputs_outputs",
 		"block_height":          ch.Height(),
 		"chain_length":          ch.Len(),
 		"peers":                 len(s.Network.GetPeers()),
@@ -373,7 +356,7 @@ func (s *Server) handleMempool(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSign signs a transaction and returns it without broadcasting.
+// handleSign signs a transaction using the wallet builder and returns it without broadcasting.
 // POST /sign — body: {from, to, amount, private_key}
 func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -419,28 +402,22 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		from = derived
 	}
 
-	sig, err := crypto.SignTransaction(req.PrivateKey, from, req.To, req.Amount)
+	// Use the wallet-level builder to create the transaction.
+	tx, err := s.Ledger.BuildTransaction(req.PrivateKey, from, req.To, req.Amount)
 	if err != nil {
-		errorResponse(w, http.StatusBadRequest, "signing failed: "+err.Error())
+		errorResponse(w, http.StatusBadRequest, "build failed: "+err.Error())
 		return
-	}
-
-	tx := block.Transaction{
-		From:      from,
-		To:        req.To,
-		Amount:    req.Amount,
-		Signature: sig,
 	}
 
 	slog.Debug("TX signed", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"transaction": tx,
-		"signature":   sig,
+		"txid":        tx.ID,
 	})
 }
 
-// handleSend is the all-in-one endpoint: sign + validate + chain + broadcast.
+// handleSend is the all-in-one endpoint: build + sign + validate + chain + broadcast.
 // POST /send — body: {from, to, amount, private_key}
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -486,22 +463,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		from = derived
 	}
 
-	sig, err := crypto.SignTransaction(req.PrivateKey, from, req.To, req.Amount)
+	// Use the wallet-level builder to create the transaction.
+	tx, err := s.Ledger.BuildTransaction(req.PrivateKey, from, req.To, req.Amount)
 	if err != nil {
-		errorResponse(w, http.StatusBadRequest, "signing failed: "+err.Error())
+		errorResponse(w, http.StatusBadRequest, "build failed: "+err.Error())
 		return
-	}
-
-	tx := block.Transaction{
-		From:      from,
-		To:        req.To,
-		Amount:    req.Amount,
-		Signature: sig,
 	}
 
 	slog.Info("Processing send", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
-	if err := s.Ledger.SubmitTransaction(tx); err != nil {
+	if err := s.Ledger.SubmitTransaction(*tx); err != nil {
 		m.TxRejected.Inc()
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -511,15 +482,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	s.updateMetrics()
 
 	// Broadcast to peers.
-	go s.Network.BroadcastTransaction(tx)
+	go s.Network.BroadcastTransaction(*tx)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
 		"message":     "transaction sent",
-		"id":          s.Ledger.GetChain().LastHash(),
+		"txid":        tx.ID,
 		"from":        from,
 		"to":          req.To,
 		"amount":      req.Amount,
-		"signature":   sig,
 		"new_balance": s.Ledger.GetBalance(from),
 	})
 }
@@ -559,9 +529,10 @@ func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	go s.Network.BroadcastTransaction(*tx)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":          fmt.Sprintf("%.0f coins sent from faucet", tx.Amount),
+		"message":          fmt.Sprintf("%.0f coins sent from faucet", tx.Outputs[0].Amount),
 		"to":               req.To,
-		"amount":           tx.Amount,
+		"amount":           tx.Outputs[0].Amount,
+		"txid":             tx.ID,
 		"new_balance":      s.Ledger.GetBalance(req.To),
 		"faucet_remaining": s.Ledger.FaucetRemaining(),
 	})
