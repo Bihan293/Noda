@@ -4,23 +4,46 @@ All notable changes to Noda are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.0] — 2026-03-27
 
 ### Added
-- Full test suite for all packages:
-  - `crypto/` — key generation, sign/verify round-trip, error handling
-  - `block/` — PoW, Merkle tree, difficulty adjustment, halving, genesis block, validation
-  - `chain/` — blockchain creation, block addition, serialization, chain validation
-  - `mempool/` — add/remove/evict, FIFO ordering, double-spend detection
-  - `utxo/` — add/spend/balance, ApplyBlock, rebuild from blocks, serialization
-  - `ledger/` — faucet state, transaction validation, persistence, chain replacement
-  - `p2p/` — message encoding/decoding, peer state, payload round-trips
-  - `network/` — peer management, broadcast
-  - `api/` — all HTTP endpoints, error responses, middleware
-  - `integration/` — end-to-end mining, UTXO consistency, tokenomics verification
-- CI pipeline via GitHub Actions (build, test, vet)
-- `CONTRIBUTING.md` — contribution guidelines
-- `CHANGELOG.md` — this file
+- **Structured logging** — migrated from `log` to `log/slog` across all packages
+  - Configurable log level via `LOG_LEVEL` env var or `-log-level` flag (debug/info/warn/error)
+  - Key-value structured log entries for machine-parseable output
+- **Prometheus metrics** — `/metrics` endpoint in Prometheus text exposition format
+  - Block height, block count, total mined/faucet coins, block reward, difficulty
+  - Mempool size, UTXO count, peer counts (HTTP + TCP)
+  - Faucet remaining supply and active status
+  - HTTP request counters and duration
+  - Transaction accepted/rejected counters
+  - P2P message counters
+  - Zero external dependencies (custom metrics package)
+- **Rate limiting** — per-IP token-bucket rate limiter
+  - Configurable via `RATE_LIMIT` env var or `-rate-limit` flag (default: 10 req/s)
+  - Returns 429 Too Many Requests with Retry-After header
+  - Automatic stale client cleanup
+- **Graceful shutdown** — proper context-based shutdown
+  - HTTP server graceful drain (10s timeout)
+  - P2P node clean disconnect
+  - OS signal handling (SIGINT, SIGTERM)
+- **Security hardening**
+  - Input validation for addresses (hex format, max length)
+  - Request body size limits (64 KB max)
+  - HTTP server timeouts (read: 15s, write: 30s, idle: 60s)
+  - Security headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
+  - Peer URL validation (must start with http:// or https://)
+- **Health check endpoint** — `GET /health` (lightweight, no rate limiting)
+- **Docker Compose** — multi-node local network (3 nodes with auto-discovery)
+- **New packages**: `metrics/`, `ratelimit/`
+- Updated Dockerfile with P2P port exposure and health check
+
+### Changed
+- `api.Server.Start()` now accepts `context.Context` for graceful shutdown
+- `api.Server` struct has new `RateLimiter` field
+- P2P UserAgent updated to `/Noda:0.5.0/`
+- Upgraded HTTP server with proper timeouts and max header size
+
+## [Unreleased]
 
 ## [0.4.0] — 2026-03-27
 
@@ -34,6 +57,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Initial Block Download (IBD) via getblocks
   - Peer discovery via addr messages
   - Ban system for misbehaving peers
+- Full test suite for all packages
+- CI pipeline via GitHub Actions (build, test, vet)
+- `CONTRIBUTING.md` — contribution guidelines
 
 ## [0.3.0] — 2026-03-27
 

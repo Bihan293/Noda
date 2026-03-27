@@ -191,9 +191,9 @@ Difficulty Adjustment:    Every 2016 blocks (target: ~10 min/block)
 
 | Stage | Description | Status |
 |-------|-------------|--------|
-| 1 | Blocks + PoW + Halving | Pending |
-| 2 | Mempool + UTXO + Faucet 11M cap | Pending |
-| 3 | TCP P2P Protocol | Pending |
+| 1 | Blocks + PoW + Halving | **Done** |
+| 2 | Mempool + UTXO + Faucet 11M cap | **Done** |
+| 3 | TCP P2P Protocol | **Done** |
 | 4 | Storage + Chain Reorg | Pending |
-| 5 | Tests + Open-Source | Pending |
-| 6 | Production Polish | Pending |
+| 5 | Tests + Open-Source | **Done** |
+| 6 | Production Polish | **Done** |

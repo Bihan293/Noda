@@ -1,31 +1,41 @@
 // Package api provides the HTTP server with JSON endpoints for interacting
 // with the cryptocurrency node.
 //
-// Updated for:
+// Production features:
 //   - UTXO-based balance queries
 //   - Mempool status and pending transactions
 //   - Faucet with global 11M cap (no per-address cooldown)
 //   - Block-based chain with PoW, halving
+//   - Structured logging via log/slog
+//   - Prometheus-compatible /metrics endpoint
+//   - Rate limiting per IP
+//   - Graceful shutdown with context
+//   - Input validation and security headers
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/ledger"
+	m "github.com/Bihan293/Noda/metrics"
 	"github.com/Bihan293/Noda/network"
+	"github.com/Bihan293/Noda/ratelimit"
 )
 
 // Server wraps the ledger and network layer to serve HTTP requests.
 type Server struct {
-	Ledger  *ledger.Ledger
-	Network *network.Network
-	Port    string
+	Ledger      *ledger.Ledger
+	Network     *network.Network
+	Port        string
+	RateLimiter *ratelimit.Limiter
 }
 
 // ---------- Helpers ----------
@@ -42,12 +52,30 @@ func errorResponse(w http.ResponseWriter, status int, msg string) {
 	jsonResponse(w, status, map[string]string{"error": msg})
 }
 
+// securityHeaders adds common security headers to responses.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // loggingMiddleware wraps a handler and logs every request with timing.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("[HTTP] %s %s — %s", r.Method, r.URL.Path, time.Since(start).Round(time.Microsecond))
+		duration := time.Since(start)
+		m.HTTPRequestsTotal.Inc()
+		m.HTTPRequestDuration.Set(float64(duration.Microseconds()) / 1000.0)
+		slog.Debug("HTTP request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"duration", duration.Round(time.Microsecond).String(),
+			"remote", r.RemoteAddr,
+		)
 	})
 }
 
@@ -81,7 +109,54 @@ type KeyPairResponse struct {
 	PrivateKey string `json:"private_key"`
 }
 
+// ---------- Input validation ----------
+
+const (
+	maxAddressLen    = 256
+	maxSignatureLen  = 256
+	maxPrivateKeyLen = 256
+	maxBodySize      = 1 << 16 // 64 KB
+)
+
+// validateHex checks if a string contains only valid hex characters.
+func validateHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateAddress checks address format and length.
+func validateAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("address is required")
+	}
+	if len(addr) > maxAddressLen {
+		return fmt.Errorf("address too long (max %d chars)", maxAddressLen)
+	}
+	if !validateHex(addr) {
+		return fmt.Errorf("address must be hex-encoded")
+	}
+	return nil
+}
+
 // ---------- Handlers ----------
+
+// handleHealth is a lightweight health check endpoint.
+// GET /health
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errorResponse(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]string{
+		"status": "ok",
+		"node":   "noda",
+		"version": "0.5.0",
+	})
+}
 
 // handleBalance returns the balance for a given address (from UTXO set).
 // GET /balance?address=<hex_pubkey>
@@ -91,18 +166,18 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	addr := r.URL.Query().Get("address")
-	if addr == "" {
-		errorResponse(w, http.StatusBadRequest, "address query parameter required")
+	if err := validateAddress(addr); err != nil {
+		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	balance := s.Ledger.GetBalance(addr)
 	pendingSpend := s.Ledger.Mempool.GetSpendingTotal(addr)
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"address":         addr,
-		"balance":         balance,
-		"pending_spend":   pendingSpend,
-		"available":       balance - pendingSpend,
-		"utxo_count":      len(s.Ledger.UTXOSet.GetUTXOsForAddress(addr)),
+		"address":       addr,
+		"balance":       balance,
+		"pending_spend": pendingSpend,
+		"available":     balance - pendingSpend,
+		"utxo_count":    len(s.Ledger.UTXOSet.GetUTXOsForAddress(addr)),
 	})
 }
 
@@ -114,14 +189,29 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var req TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("[TX] Failed to decode request body: %v", err)
+		slog.Warn("TX decode failed", "error", err)
 		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
-	log.Printf("[TX] Received: %s -> %s (%.2f coins)", shortAddr(req.From), shortAddr(req.To), req.Amount)
+	// Input validation.
+	if err := validateAddress(req.From); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid 'from': "+err.Error())
+		return
+	}
+	if err := validateAddress(req.To); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid 'to': "+err.Error())
+		return
+	}
+	if len(req.Signature) > maxSignatureLen || !validateHex(req.Signature) {
+		errorResponse(w, http.StatusBadRequest, "invalid signature format")
+		return
+	}
+
+	slog.Info("TX received", "from", shortAddr(req.From), "to", shortAddr(req.To), "amount", req.Amount)
 
 	tx := block.Transaction{
 		From:      req.From,
@@ -131,9 +221,13 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.Ledger.SubmitTransaction(tx); err != nil {
+		m.TxRejected.Inc()
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	m.TxAccepted.Inc()
+	s.updateMetrics()
 
 	// Broadcast the valid transaction to all peers.
 	go s.Network.BroadcastTransaction(tx)
@@ -166,7 +260,7 @@ func (s *Server) handleGenerateKeys(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, "key generation failed")
 		return
 	}
-	log.Printf("[KEYS] Generated new key pair — address: %s", shortAddr(kp.Address))
+	slog.Debug("Keys generated", "address", shortAddr(kp.Address))
 	jsonResponse(w, http.StatusOK, KeyPairResponse{
 		Address:    kp.Address,
 		PublicKey:  kp.Address,
@@ -193,11 +287,17 @@ func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var body struct {
 		Peer string `json:"peer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Peer == "" {
 		errorResponse(w, http.StatusBadRequest, "peer URL required")
+		return
+	}
+	// Basic URL validation.
+	if !strings.HasPrefix(body.Peer, "http://") && !strings.HasPrefix(body.Peer, "https://") {
+		errorResponse(w, http.StatusBadRequest, "peer URL must start with http:// or https://")
 		return
 	}
 	s.Network.AddPeer(body.Peer)
@@ -215,6 +315,9 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replaced := s.Network.SyncChain(s.Ledger)
+	if replaced {
+		s.updateMetrics()
+	}
 	jsonResponse(w, http.StatusOK, map[string]bool{
 		"chain_replaced": replaced,
 	})
@@ -230,6 +333,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
 		"port":          s.Port,
+		"version":       "0.5.0",
 		"block_height":  ch.Height(),
 		"chain_length":  ch.Len(),
 		"peers":         len(s.Network.GetPeers()),
@@ -241,6 +345,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"mempool_size":  s.Ledger.GetMempoolSize(),
 		"utxo_count":    s.Ledger.UTXOSet.Size(),
 		"p2p_peers":     s.Network.PeerCount(),
+		"max_supply":    block.MaxTotalSupply,
 	}
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
@@ -272,6 +377,7 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var req SendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
@@ -282,8 +388,16 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "private_key is required")
 		return
 	}
+	if len(req.PrivateKey) > maxPrivateKeyLen || !validateHex(req.PrivateKey) {
+		errorResponse(w, http.StatusBadRequest, "invalid private_key format")
+		return
+	}
 	if req.To == "" {
 		errorResponse(w, http.StatusBadRequest, "'to' address is required")
+		return
+	}
+	if err := validateAddress(req.To); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid 'to': "+err.Error())
 		return
 	}
 	if req.Amount <= 0 {
@@ -314,7 +428,7 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		Signature: sig,
 	}
 
-	log.Printf("[SIGN] Signed TX: %s -> %s (%.2f coins)", shortAddr(from), shortAddr(req.To), req.Amount)
+	slog.Debug("TX signed", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"transaction": tx,
@@ -330,6 +444,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var req SendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
@@ -340,8 +455,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "private_key is required")
 		return
 	}
+	if len(req.PrivateKey) > maxPrivateKeyLen || !validateHex(req.PrivateKey) {
+		errorResponse(w, http.StatusBadRequest, "invalid private_key format")
+		return
+	}
 	if req.To == "" {
 		errorResponse(w, http.StatusBadRequest, "'to' address is required")
+		return
+	}
+	if err := validateAddress(req.To); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid 'to': "+err.Error())
 		return
 	}
 	if req.Amount <= 0 {
@@ -372,12 +495,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Signature: sig,
 	}
 
-	log.Printf("[SEND] Processing: %s -> %s (%.2f coins)", shortAddr(from), shortAddr(req.To), req.Amount)
+	slog.Info("Processing send", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
 	if err := s.Ledger.SubmitTransaction(tx); err != nil {
+		m.TxRejected.Inc()
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	m.TxAccepted.Inc()
+	s.updateMetrics()
 
 	// Broadcast to peers.
 	go s.Network.BroadcastTransaction(tx)
@@ -402,24 +529,27 @@ func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var req FaucetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
-	if req.To == "" {
-		errorResponse(w, http.StatusBadRequest, "'to' address is required")
+	if err := validateAddress(req.To); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid 'to': "+err.Error())
 		return
 	}
 
-	log.Printf("[FAUCET] Request from %s", shortAddr(req.To))
+	slog.Info("Faucet request", "to", shortAddr(req.To))
 
 	tx, err := s.Ledger.ProcessFaucet(req.To)
 	if err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	s.updateMetrics()
 
 	// Broadcast faucet transaction to peers.
 	go s.Network.BroadcastTransaction(*tx)
@@ -433,11 +563,39 @@ func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---------- Metrics update ----------
+
+// updateMetrics syncs all gauge metrics with the current ledger state.
+func (s *Server) updateMetrics() {
+	ch := s.Ledger.GetChain()
+	m.BlockHeight.Set(int64(ch.Height()))
+	m.BlockCount.Set(int64(ch.Len()))
+	m.TotalMined.Set(ch.TotalMined)
+	m.TotalFaucet.Set(ch.TotalFaucet)
+	m.BlockReward.Set(s.Ledger.GetBlockReward())
+	m.MempoolSize.Set(int64(s.Ledger.GetMempoolSize()))
+	m.UTXOCount.Set(int64(s.Ledger.UTXOSet.Size()))
+	m.PeerCount.Set(int64(s.Network.PeerCount()))
+	m.FaucetRemaining.Set(s.Ledger.FaucetRemaining())
+	if s.Ledger.IsFaucetActive() {
+		m.FaucetActive.Set(1)
+	} else {
+		m.FaucetActive.Set(0)
+	}
+}
+
 // ---------- Router ----------
 
 // Start registers routes and starts the HTTP server on the given port.
-func (s *Server) Start() error {
+// Supports graceful shutdown via the provided context.
+func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
+
+	// Health check (no rate limiting).
+	mux.HandleFunc("/health", s.handleHealth)
+
+	// Prometheus metrics endpoint (no rate limiting).
+	mux.Handle("/metrics", m.Handler())
 
 	// Core endpoints
 	mux.HandleFunc("/balance", s.handleBalance)
@@ -467,11 +625,45 @@ func (s *Server) Start() error {
 	})
 	mux.HandleFunc("/sync", s.handleSync)
 
-	addr := ":" + s.Port
-	log.Printf("=== Noda Node listening on http://0.0.0.0%s ===", addr)
-	log.Printf("Endpoints: /balance /transaction /chain /sign /send /faucet /generate-keys /status /mempool /peers /sync")
+	// Apply middleware chain: security → rate limiting → logging → routes.
+	var handler http.Handler = mux
+	if s.RateLimiter != nil {
+		handler = s.RateLimiter.Middleware(handler)
+	}
+	handler = loggingMiddleware(handler)
+	handler = securityHeaders(handler)
 
-	return http.ListenAndServe(addr, loggingMiddleware(mux))
+	addr := ":" + s.Port
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
+	}
+
+	slog.Info("Noda Node listening",
+		"address", "http://0.0.0.0"+addr,
+		"endpoints", "/health /metrics /balance /transaction /chain /sign /send /faucet /generate-keys /status /mempool /peers /sync",
+	)
+
+	// Graceful shutdown.
+	go func() {
+		<-ctx.Done()
+		slog.Info("Shutting down HTTP server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("HTTP server shutdown error", "error", err)
+		}
+	}()
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 // shortAddr returns the first 8 and last 4 chars of an address for logging.
