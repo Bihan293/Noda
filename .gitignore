@@ -1,0 +1,17 @@
+# Binary
+noda
+
+# Data files
+node_data.json
+*.json
+!go.mod
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
