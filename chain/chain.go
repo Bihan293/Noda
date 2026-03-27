@@ -16,7 +16,7 @@ const GenesisSupply = 11_000_000
 
 // GenesisAddress is a well-known address that holds all coins at the start.
 // It is the hex-encoded string of "GENESIS" padded to look like a public key.
-const GenesisAddress := "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
+const GenesisAddress = "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
 
 // Transaction represents a single transfer of coins between two addresses.
 type Transaction struct {
