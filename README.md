@@ -360,27 +360,93 @@ curl -s -X POST http://localhost:3000/sync | jq
 ├── Dockerfile           # Multi-stage Docker build (golang:alpine → alpine)
 ├── .dockerignore        # Excludes unnecessary files from Docker context
 ├── crypto/
-│   └── crypto.go        # Ed25519 key gen, signing, verification, SignTransaction
+│   ├── crypto.go        # Ed25519 key gen, signing, verification, SignTransaction
+│   └── crypto_test.go   # Key pair, sign/verify, address derivation tests
+├── block/
+│   ├── block.go         # Block structure, PoW, Merkle tree, halving, genesis
+│   └── block_test.go    # PoW, difficulty, halving, Merkle, validation tests
 ├── chain/
-│   └── chain.go         # Transaction struct, blockchain, hashing, genesis
+│   ├── chain.go         # Blockchain management and serialization
+│   └── chain_test.go    # Chain creation, block addition, JSON round-trip tests
+├── mempool/
+│   ├── mempool.go       # In-memory unconfirmed transaction pool
+│   └── mempool_test.go  # Add/remove, FIFO, eviction, double-spend tests
+├── utxo/
+│   ├── utxo.go          # Unspent Transaction Output set
+│   └── utxo_test.go     # Add/spend, balance, ApplyBlock, rebuild tests
 ├── ledger/
-│   └── ledger.go        # Balances, validation, faucet, JSON persistence
+│   ├── ledger.go        # Ledger: chain + UTXO + mempool + faucet
+│   └── ledger_test.go   # Faucet, validation, persistence, replacement tests
 ├── api/
-│   └── server.go        # HTTP server, all endpoints, request logging
+│   ├── server.go        # HTTP server, all REST endpoints
+│   └── server_test.go   # All endpoint tests with httptest
 ├── network/
-│   └── network.go       # Peer management, broadcast, chain sync
+│   ├── network.go       # HTTP-based P2P networking
+│   └── network_test.go  # Peer management tests
+├── p2p/
+│   ├── message.go       # TCP protocol messages and wire encoding
+│   ├── node.go          # P2P node, handshake, block/tx relay
+│   └── p2p_test.go      # Message encoding, peer state, payload tests
+├── integration/
+│   └── integration_test.go  # End-to-end tests (mining, UTXO, tokenomics)
+├── .github/
+│   └── workflows/
+│       └── ci.yml       # GitHub Actions CI (build, test, vet)
 ├── go.mod               # Go module (zero external dependencies)
+├── CONTRIBUTING.md      # Contribution guidelines
+├── CHANGELOG.md         # Version history
+├── ROADMAP.md           # Development roadmap
 └── README.md
 ```
 
+## Testing
+
+Noda has comprehensive test coverage across all packages.
+
+### Run all tests
+
+```bash
+go test ./... -v -race -count=1
+```
+
+### Run tests for a specific package
+
+```bash
+go test ./block/ -v
+go test ./crypto/ -v
+go test ./integration/ -v
+```
+
+### Test Coverage
+
+| Package | Tests |
+|---------|-------|
+| `crypto/` | Key generation, sign/verify round-trip, invalid inputs |
+| `block/` | PoW mining, Merkle tree, difficulty adjustment, halving, genesis, validation |
+| `chain/` | Blockchain creation, block addition, serialization, chain validation |
+| `mempool/` | Add/remove, FIFO ordering, eviction, double-spend detection |
+| `utxo/` | Add/spend, balance queries, ApplyBlock, rebuild from blocks |
+| `ledger/` | Faucet state, transaction validation, persistence, chain replacement |
+| `p2p/` | Message encoding/decoding, peer state, payload round-trips |
+| `network/` | Peer management, broadcast |
+| `api/` | All HTTP endpoints, error responses, middleware |
+| `integration/` | End-to-end mining, UTXO consistency, tokenomics verification |
+
+### CI Pipeline
+
+GitHub Actions runs on every push and pull request:
+- `go build ./...` — compilation check
+- `go test ./... -v -race` — full test suite with race detector
+- `go vet ./...` — static analysis
+
 ## Validation Rules
 
-1. **No coin creation** — only the genesis transaction mints coins
+1. **No coin creation** — only genesis and coinbase transactions create coins
 2. **Signature required** — every transaction must have a valid Ed25519 signature over `from:to:amount`
-3. **Sufficient balance** — sender must have enough coins
+3. **Sufficient balance** — sender must have enough coins (checked via UTXO set)
 4. **Positive amount** — transaction amount must be > 0
 5. **No self-sends** — sender and receiver must differ
-6. **Faucet cooldown** — 60-second cooldown per address
+6. **Faucet global cap** — faucet disabled permanently after 11,000,000 coins distributed
 
 ## Error Messages
 
