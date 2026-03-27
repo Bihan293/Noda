@@ -1,104 +1,208 @@
-// Package chain defines the transaction and blockchain data structures.
-// Transactions are linked into a chain via sequential hashes, forming an
-// append-only ledger similar to a simplified blockchain.
+// Package chain manages the blockchain — an ordered sequence of blocks.
+// It provides methods to add blocks, query state, and serialize/deserialize
+// the chain for persistence and P2P synchronization.
 package chain
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"time"
+	"log"
+	"math/big"
+	"sync"
+
+	"github.com/Bihan293/Noda/block"
 )
 
-// GenesisSupply is the total fixed coin supply created in the genesis transaction.
-const GenesisSupply = 11_000_000
-
-// GenesisAddress is a well-known address that holds all coins at the start.
-// It is the hex-encoded string of "GENESIS" padded to look like a public key.
-const GenesisAddress = "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
-
-// Transaction represents a single transfer of coins between two addresses.
-type Transaction struct {
-	ID        string  `json:"id"`        // SHA-256 hash of the transaction content
-	From      string  `json:"from"`      // sender address (hex public key)
-	To        string  `json:"to"`        // receiver address (hex public key)
-	Amount    float64 `json:"amount"`    // coin amount (must be > 0)
-	Timestamp int64   `json:"timestamp"` // unix timestamp (seconds)
-	Signature string  `json:"signature"` // hex-encoded Ed25519 signature
-	PrevHash  string  `json:"prev_hash"` // hash of the previous transaction in the chain
-}
-
-// Blockchain is an ordered list of transactions forming the ledger.
+// Blockchain is an ordered list of blocks forming the ledger.
 type Blockchain struct {
-	Transactions []Transaction `json:"transactions"`
+	Blocks      []*block.Block `json:"blocks"`
+	TotalMined  float64        `json:"total_mined"`  // total coins created via mining rewards
+	TotalFaucet float64        `json:"total_faucet"`  // total coins distributed via faucet
+	Target      *big.Int       `json:"-"`             // current difficulty target (not serialized directly)
+	TargetHex   string         `json:"target_hex"`    // hex-serialized target for JSON persistence
+	mu          sync.RWMutex
 }
 
-// NewBlockchain creates an empty blockchain and inserts the genesis transaction.
-// The genesis TX creates the total supply and assigns it to GenesisAddress.
+// NewBlockchain creates a new blockchain with the genesis block.
 func NewBlockchain() *Blockchain {
 	bc := &Blockchain{
-		Transactions: make([]Transaction, 0),
+		Blocks:    make([]*block.Block, 0),
+		Target:    new(big.Int).Set(block.InitialTarget),
+		TargetHex: block.BitsFromTarget(block.InitialTarget),
 	}
 	bc.addGenesis()
 	return bc
 }
 
-// addGenesis appends the genesis transaction that mints the entire coin supply.
-// It has no "from" address, no signature, and an empty previous hash.
+// addGenesis appends the genesis block.
 func (bc *Blockchain) addGenesis() {
-	genesis := Transaction{
-		From:      "",               // no sender — coins are created
-		To:        GenesisAddress,
-		Amount:    GenesisSupply,
-		Timestamp: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
-		Signature: "genesis",
-		PrevHash:  "",
-	}
-	genesis.ID = HashTransaction(genesis)
-	bc.Transactions = append(bc.Transactions, genesis)
+	genesis := block.NewGenesisBlock()
+	bc.Blocks = append(bc.Blocks, genesis)
+	log.Printf("[CHAIN] Genesis block created — hash: %s", genesis.Hash[:16])
 }
 
-// LastHash returns the hash of the most recent transaction in the chain.
+// Height returns the height of the last block (0-indexed).
+func (bc *Blockchain) Height() uint64 {
+	if len(bc.Blocks) == 0 {
+		return 0
+	}
+	return bc.Blocks[len(bc.Blocks)-1].Header.Height
+}
+
+// Len returns the number of blocks in the chain.
+func (bc *Blockchain) Len() int {
+	return len(bc.Blocks)
+}
+
+// LastBlock returns the most recent block.
+func (bc *Blockchain) LastBlock() *block.Block {
+	if len(bc.Blocks) == 0 {
+		return nil
+	}
+	return bc.Blocks[len(bc.Blocks)-1]
+}
+
+// LastHash returns the hash of the most recent block.
 func (bc *Blockchain) LastHash() string {
-	if len(bc.Transactions) == 0 {
+	last := bc.LastBlock()
+	if last == nil {
 		return ""
 	}
-	return bc.Transactions[len(bc.Transactions)-1].ID
+	return last.Hash
 }
 
-// AddTransaction appends a validated transaction to the chain.
-// The caller is responsible for validation before calling this.
-func (bc *Blockchain) AddTransaction(tx Transaction) {
-	tx.PrevHash = bc.LastHash()
-	tx.ID = HashTransaction(tx)
-	bc.Transactions = append(bc.Transactions, tx)
+// GetBlock returns the block at the given height, or nil if out of range.
+func (bc *Blockchain) GetBlock(height uint64) *block.Block {
+	if height >= uint64(len(bc.Blocks)) {
+		return nil
+	}
+	return bc.Blocks[height]
 }
 
-// Len returns the number of transactions in the chain.
-func (bc *Blockchain) Len() int {
-	return len(bc.Transactions)
+// AddBlock validates and appends a new block to the chain.
+// It checks header integrity, PoW, Merkle root, and chain linkage.
+func (bc *Blockchain) AddBlock(b *block.Block) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	expectedHeight := bc.Height() + 1
+	expectedPrevHash := bc.LastHash()
+
+	// Validate the block.
+	if err := block.ValidateBlock(b, expectedPrevHash, expectedHeight); err != nil {
+		return fmt.Errorf("block validation failed: %w", err)
+	}
+
+	// Track mined coins from coinbase transaction (first TX in block, if coinbase).
+	if len(b.Transactions) > 0 && b.Transactions[0].From == "" && b.Header.Height > 0 {
+		bc.TotalMined += b.Transactions[0].Amount
+	}
+
+	bc.Blocks = append(bc.Blocks, b)
+
+	// Adjust difficulty if needed.
+	if expectedHeight > 0 && expectedHeight%block.DifficultyAdjustmentInterval == 0 {
+		bc.adjustDifficulty()
+	}
+
+	return nil
 }
 
-// HashTransaction computes the SHA-256 hash of a transaction's content.
-// The ID field is excluded from hashing to avoid circular dependency.
-func HashTransaction(tx Transaction) string {
-	record := fmt.Sprintf("%s:%s:%f:%d:%s:%s",
-		tx.From, tx.To, tx.Amount, tx.Timestamp, tx.Signature, tx.PrevHash)
-	h := sha256.Sum256([]byte(record))
-	return hex.EncodeToString(h[:])
+// adjustDifficulty recalculates the mining target based on actual block times.
+func (bc *Blockchain) adjustDifficulty() {
+	height := bc.Height()
+	if height < block.DifficultyAdjustmentInterval {
+		return
+	}
+
+	// Look back DifficultyAdjustmentInterval blocks.
+	lastBlock := bc.Blocks[height]
+	firstBlock := bc.Blocks[height-block.DifficultyAdjustmentInterval]
+
+	actualTimeSpan := lastBlock.Header.Timestamp - firstBlock.Header.Timestamp
+
+	oldTarget := bc.Target
+	bc.Target = block.AdjustDifficulty(oldTarget, actualTimeSpan)
+	bc.TargetHex = block.BitsFromTarget(bc.Target)
+
+	log.Printf("[DIFFICULTY] Adjusted at height %d — time span: %ds, old target: %s..., new target: %s...",
+		height, actualTimeSpan, block.BitsFromTarget(oldTarget)[:16], bc.TargetHex[:16])
 }
+
+// GetTarget returns the current difficulty target.
+func (bc *Blockchain) GetTarget() *big.Int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return new(big.Int).Set(bc.Target)
+}
+
+// GetBlockReward returns the mining reward for the next block.
+func (bc *Blockchain) GetBlockReward() float64 {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	nextHeight := bc.Height() + 1
+	return block.BlockReward(nextHeight, bc.TotalMined)
+}
+
+// AllTransactions returns all transactions across all blocks (for compatibility).
+func (bc *Blockchain) AllTransactions() []block.Transaction {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	var all []block.Transaction
+	for _, b := range bc.Blocks {
+		all = append(all, b.Transactions...)
+	}
+	return all
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Serialization
+// ──────────────────────────────────────────────────────────────────────────────
 
 // ToJSON serializes the blockchain to indented JSON bytes.
 func (bc *Blockchain) ToJSON() ([]byte, error) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
 	return json.MarshalIndent(bc, "", "  ")
 }
 
-// FromJSON deserializes a blockchain from JSON bytes.
+// FromJSON deserializes a blockchain from JSON bytes and rebuilds the target.
 func FromJSON(data []byte) (*Blockchain, error) {
 	var bc Blockchain
 	if err := json.Unmarshal(data, &bc); err != nil {
 		return nil, fmt.Errorf("chain deserialization failed: %w", err)
 	}
+
+	// Rebuild target from hex.
+	if bc.TargetHex != "" {
+		bc.Target = block.TargetFromBits(bc.TargetHex)
+	} else {
+		bc.Target = new(big.Int).Set(block.InitialTarget)
+		bc.TargetHex = block.BitsFromTarget(block.InitialTarget)
+	}
+
 	return &bc, nil
+}
+
+// ValidateChain checks the full integrity of a blockchain from genesis to tip.
+func ValidateChain(bc *Blockchain) error {
+	if len(bc.Blocks) == 0 {
+		return fmt.Errorf("empty blockchain")
+	}
+
+	for i, b := range bc.Blocks {
+		var expectedPrevHash string
+		if i == 0 {
+			expectedPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
+		} else {
+			expectedPrevHash = bc.Blocks[i-1].Hash
+		}
+
+		if err := block.ValidateBlock(b, expectedPrevHash, uint64(i)); err != nil {
+			return fmt.Errorf("block %d: %w", i, err)
+		}
+	}
+
+	return nil
 }

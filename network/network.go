@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/chain"
 	"github.com/Bihan293/Noda/ledger"
 )
@@ -43,11 +44,11 @@ func (n *Network) AddPeer(url string) {
 	defer n.mu.Unlock()
 	for _, p := range n.peers {
 		if p == url {
-			return // already known
+			return
 		}
 	}
 	n.peers = append(n.peers, url)
-	log.Printf("📡 Peer added: %s (total: %d)", url, len(n.peers))
+	log.Printf("[PEER] Added: %s (total: %d)", url, len(n.peers))
 }
 
 // GetPeers returns a copy of the peer list.
@@ -60,8 +61,7 @@ func (n *Network) GetPeers() []string {
 }
 
 // BroadcastTransaction sends a transaction to all known peers via POST /transaction.
-// Errors from individual peers are logged but do not stop the broadcast.
-func (n *Network) BroadcastTransaction(tx chain.Transaction) {
+func (n *Network) BroadcastTransaction(tx block.Transaction) {
 	body, err := json.Marshal(map[string]interface{}{
 		"from":      tx.From,
 		"to":        tx.To,
@@ -69,7 +69,7 @@ func (n *Network) BroadcastTransaction(tx chain.Transaction) {
 		"signature": tx.Signature,
 	})
 	if err != nil {
-		log.Printf("broadcast marshal error: %v", err)
+		log.Printf("[BROADCAST] marshal error: %v", err)
 		return
 	}
 
@@ -79,11 +79,11 @@ func (n *Network) BroadcastTransaction(tx chain.Transaction) {
 			url := peerURL + "/transaction"
 			resp, err := n.client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
-				log.Printf("broadcast to %s failed: %v", peerURL, err)
+				log.Printf("[BROADCAST] to %s failed: %v", peerURL, err)
 				return
 			}
 			resp.Body.Close()
-			log.Printf("📤 Broadcast to %s: status %d", peerURL, resp.StatusCode)
+			log.Printf("[BROADCAST] to %s: status %d", peerURL, resp.StatusCode)
 		}(peer)
 	}
 }
@@ -97,11 +97,11 @@ func (n *Network) SyncChain(l *ledger.Ledger) bool {
 	for _, peer := range peers {
 		peerChain, err := n.fetchChain(peer)
 		if err != nil {
-			log.Printf("sync from %s failed: %v", peer, err)
+			log.Printf("[SYNC] from %s failed: %v", peer, err)
 			continue
 		}
 		if l.ReplaceChain(peerChain) {
-			log.Printf("🔄 Chain replaced from peer %s (length %d)", peer, peerChain.Len())
+			log.Printf("[SYNC] Chain replaced from peer %s (length %d)", peer, peerChain.Len())
 			replaced = true
 		}
 	}
