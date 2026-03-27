@@ -14,7 +14,7 @@ package ledger
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -71,7 +71,7 @@ func NewLedger(filePath string) *Ledger {
 	// Build UTXO set from genesis block.
 	utxoSet, err := utxo.RebuildFromBlocks(bc.Blocks)
 	if err != nil {
-		log.Printf("[LEDGER] Warning: UTXO rebuild failed: %v — starting with empty set", err)
+		slog.Warn("UTXO rebuild failed, starting with empty set", "error", err)
 		utxoSet = utxo.NewSet()
 	}
 
@@ -86,8 +86,11 @@ func NewLedger(filePath string) *Ledger {
 		Mempool:  mempool.New(mempool.DefaultMaxSize),
 	}
 
-	log.Printf("[LEDGER] New ledger created — genesis supply: %.0f coins at %s, UTXO count: %d",
-		block.GenesisSupply, block.GenesisAddress, utxoSet.Size())
+	slog.Info("New ledger created",
+		"genesis_supply", block.GenesisSupply,
+		"genesis_address", block.GenesisAddress,
+		"utxo_count", utxoSet.Size(),
+	)
 	return l
 }
 
@@ -103,7 +106,7 @@ func (l *Ledger) SetFaucetKey(privKeyHex string) error {
 	}
 	l.faucetPrivKey = privKeyHex
 	l.faucetAddress = addr
-	log.Printf("[FAUCET] Faucet wallet configured — address: %s", addr)
+	slog.Info("Faucet wallet configured", "address", addr)
 	return nil
 }
 
@@ -269,8 +272,13 @@ func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
 	// Update balance cache from UTXO.
 	l.Balances = l.UTXOSet.AllBalances()
 
-	log.Printf("[TX ACCEPTED] %s -> %s : %.2f coins (block height: %d, UTXO size: %d)",
-		shortAddr(tx.From), shortAddr(tx.To), tx.Amount, newBlock.Header.Height, l.UTXOSet.Size())
+	slog.Info("TX accepted",
+		"from", shortAddr(tx.From),
+		"to", shortAddr(tx.To),
+		"amount", tx.Amount,
+		"block_height", newBlock.Header.Height,
+		"utxo_size", l.UTXOSet.Size(),
+	)
 
 	// Persist.
 	_ = l.saveLocked()
@@ -383,8 +391,12 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 	l.Chain.TotalFaucet += amount
 	l.mu.Unlock()
 
-	log.Printf("[FAUCET] Sent %.0f coins to %s (total distributed: %.0f / %.0f)",
-		amount, shortAddr(toAddress), totalDistributed+amount, FaucetGlobalCap)
+	slog.Info("Faucet distribution",
+		"to", shortAddr(toAddress),
+		"amount", amount,
+		"total_distributed", totalDistributed+amount,
+		"global_cap", FaucetGlobalCap,
+	)
 
 	return &tx, nil
 }
@@ -405,14 +417,14 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 
 	// Validate the full chain.
 	if err := chain.ValidateChain(newChain); err != nil {
-		log.Printf("[SYNC REJECTED] invalid chain: %v", err)
+		slog.Warn("Sync rejected: invalid chain", "error", err)
 		return false
 	}
 
 	// Rebuild UTXO set from the new chain.
 	newUTXO, err := utxo.RebuildFromBlocks(newChain.Blocks)
 	if err != nil {
-		log.Printf("[SYNC REJECTED] UTXO rebuild failed: %v", err)
+		slog.Warn("Sync rejected: UTXO rebuild failed", "error", err)
 		return false
 	}
 
@@ -424,8 +436,10 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	l.Balances = balances
 	_ = l.saveLocked()
 
-	log.Printf("[SYNC] Chain replaced — new length: %d blocks, UTXO: %d outputs",
-		newChain.Len(), newUTXO.Size())
+	slog.Info("Chain replaced",
+		"blocks", newChain.Len(),
+		"utxo_count", newUTXO.Size(),
+	)
 	return true
 }
 
@@ -453,13 +467,13 @@ func (l *Ledger) saveLocked() error {
 func LoadLedger(filePath string) *Ledger {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Printf("[LEDGER] No data file found at %s — starting fresh", filePath)
+		slog.Info("No data file found, starting fresh", "path", filePath)
 		return NewLedger(filePath)
 	}
 
 	var l Ledger
 	if err := json.Unmarshal(data, &l); err != nil {
-		log.Printf("[LEDGER] Failed to parse %s: %v — starting fresh", filePath, err)
+		slog.Warn("Failed to parse data file, starting fresh", "path", filePath, "error", err)
 		return NewLedger(filePath)
 	}
 	l.filePath = filePath
@@ -480,7 +494,7 @@ func LoadLedger(filePath string) *Ledger {
 	if l.Chain != nil {
 		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
 		if err != nil {
-			log.Printf("[LEDGER] UTXO rebuild failed: %v — using balance map fallback", err)
+			slog.Warn("UTXO rebuild failed, using balance map fallback", "error", err)
 			utxoSet = utxo.NewSet()
 		} else {
 			// Sync balances from UTXO set.
@@ -494,8 +508,11 @@ func LoadLedger(filePath string) *Ledger {
 	// Initialize mempool (transient, not persisted).
 	l.Mempool = mempool.New(mempool.DefaultMaxSize)
 
-	log.Printf("[LEDGER] Loaded %d blocks from %s — UTXO: %d outputs",
-		l.Chain.Len(), filePath, l.UTXOSet.Size())
+	slog.Info("Ledger loaded",
+		"blocks", l.Chain.Len(),
+		"path", filePath,
+		"utxo_count", l.UTXOSet.Size(),
+	)
 	return &l
 }
 

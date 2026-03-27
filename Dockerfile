@@ -2,7 +2,7 @@
 # Noda — Multi-stage Docker build
 # ============================================================
 # Build:   docker build -t noda .
-# Run:     docker run -p 3000:3000 noda
+# Run:     docker run -p 3000:3000 -p 9333:9333 noda
 # ============================================================
 
 # ---------- Stage 1: Build ----------
@@ -40,14 +40,17 @@ USER noda
 
 # Default environment variables (override at runtime).
 ENV PORT=3000
+ENV P2P_PORT=9333
 ENV DATA_FILE=/app/node_data.json
+ENV LOG_LEVEL=info
+ENV RATE_LIMIT=10
 
-# Expose the default port.
-EXPOSE 3000
+# Expose HTTP and P2P ports.
+EXPOSE 3000 9333
 
-# Health check — hit the /status endpoint.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:${PORT}/status || exit 1
+# Health check — hit the /health endpoint.
+HEALTHCHECK --interval=30s --timeout=3s --start_period=5s --retries=3 \
+    CMD wget -qO- http://localhost:${PORT}/health || exit 1
 
 # Run the node.
 ENTRYPOINT ["/app/noda"]

@@ -13,7 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -65,7 +65,7 @@ func (n *Network) AddPeer(url string) {
 		}
 	}
 	n.httpPeers = append(n.httpPeers, url)
-	log.Printf("[PEER] Added HTTP peer: %s (total: %d)", url, len(n.httpPeers))
+	slog.Info("HTTP peer added", "peer", url, "total", len(n.httpPeers))
 
 	// Also add to TCP node if available.
 	if n.TCPNode != nil {
@@ -127,7 +127,7 @@ func (n *Network) httpBroadcastTransaction(tx block.Transaction) {
 		"signature": tx.Signature,
 	})
 	if err != nil {
-		log.Printf("[BROADCAST] marshal error: %v", err)
+		slog.Error("Broadcast marshal error", "error", err)
 		return
 	}
 
@@ -137,11 +137,11 @@ func (n *Network) httpBroadcastTransaction(tx block.Transaction) {
 			url := peerURL + "/transaction"
 			resp, err := n.client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
-				log.Printf("[BROADCAST] to %s failed: %v", peerURL, err)
+				slog.Debug("Broadcast failed", "peer", peerURL, "error", err)
 				return
 			}
 			resp.Body.Close()
-			log.Printf("[BROADCAST] to %s: status %d", peerURL, resp.StatusCode)
+			slog.Debug("Broadcast sent", "peer", peerURL, "status", resp.StatusCode)
 		}(peer)
 	}
 }
@@ -172,11 +172,11 @@ func (n *Network) httpSyncChain(l *ledger.Ledger) bool {
 	for _, peer := range peers {
 		peerChain, err := n.fetchChain(peer)
 		if err != nil {
-			log.Printf("[SYNC] from %s failed: %v", peer, err)
+			slog.Debug("Sync from peer failed", "peer", peer, "error", err)
 			continue
 		}
 		if l.ReplaceChain(peerChain) {
-			log.Printf("[SYNC] Chain replaced from peer %s (length %d)", peer, peerChain.Len())
+			slog.Info("Chain replaced from peer", "peer", peer, "length", peerChain.Len())
 			replaced = true
 		}
 	}

@@ -6,7 +6,7 @@ package chain
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"sync"
 
@@ -38,7 +38,7 @@ func NewBlockchain() *Blockchain {
 func (bc *Blockchain) addGenesis() {
 	genesis := block.NewGenesisBlock()
 	bc.Blocks = append(bc.Blocks, genesis)
-	log.Printf("[CHAIN] Genesis block created — hash: %s", genesis.Hash[:16])
+	slog.Info("Genesis block created", "hash", genesis.Hash[:16])
 }
 
 // Height returns the height of the last block (0-indexed).
@@ -125,8 +125,12 @@ func (bc *Blockchain) adjustDifficulty() {
 	bc.Target = block.AdjustDifficulty(oldTarget, actualTimeSpan)
 	bc.TargetHex = block.BitsFromTarget(bc.Target)
 
-	log.Printf("[DIFFICULTY] Adjusted at height %d — time span: %ds, old target: %s..., new target: %s...",
-		height, actualTimeSpan, block.BitsFromTarget(oldTarget)[:16], bc.TargetHex[:16])
+	slog.Info("Difficulty adjusted",
+		"height", height,
+		"time_span_seconds", actualTimeSpan,
+		"old_target", block.BitsFromTarget(oldTarget)[:16],
+		"new_target", bc.TargetHex[:16],
+	)
 }
 
 // GetTarget returns the current difficulty target.

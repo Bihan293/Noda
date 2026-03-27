@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -23,7 +23,7 @@ const (
 	ProtocolVersion uint32 = 1
 
 	// UserAgent identifies this node implementation.
-	UserAgent = "/Noda:0.4.0/"
+	UserAgent = "/Noda:0.5.0/"
 
 	// MaxOutboundPeers is the maximum number of outbound connections.
 	MaxOutboundPeers = 8
@@ -132,10 +132,10 @@ func (p *Peer) AddBanScore(score int, reason string) bool {
 	defer p.mu.Unlock()
 	p.BanScore += score
 	if p.BanScore >= MaxBanScore {
-		log.Printf("[P2P] Peer %s banned (score: %d, reason: %s)", p.Addr, p.BanScore, reason)
+		slog.Warn("Peer banned", "peer", p.Addr, "score", p.BanScore, "reason", reason)
 		return true
 	}
-	log.Printf("[P2P] Peer %s ban score: %d (+%d: %s)", p.Addr, p.BanScore, score, reason)
+	slog.Debug("Peer ban score increased", "peer", p.Addr, "score", p.BanScore, "added", score, "reason", reason)
 	return false
 }
 
@@ -216,7 +216,7 @@ func (n *Node) Start() error {
 		return fmt.Errorf("P2P listen failed on %s: %w", addr, err)
 	}
 
-	log.Printf("[P2P] Listening on %s (node ID: %s)", addr, n.nodeID[:16])
+	slog.Info("P2P listening", "address", addr, "node_id", n.nodeID[:16])
 
 	// Accept incoming connections.
 	n.wg.Add(1)
@@ -248,7 +248,7 @@ func (n *Node) Stop() {
 	n.mu.RUnlock()
 
 	n.wg.Wait()
-	log.Println("[P2P] Node stopped")
+	slog.Info("P2P node stopped")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ func (n *Node) acceptLoop() {
 			case <-n.quit:
 				return
 			default:
-				log.Printf("[P2P] Accept error: %v", err)
+				slog.Error("P2P accept error", "error", err)
 				continue
 			}
 		}
@@ -274,19 +274,19 @@ func (n *Node) acceptLoop() {
 
 		// Check if banned.
 		if n.isBanned(remoteAddr) {
-			log.Printf("[P2P] Rejected banned peer: %s", remoteAddr)
+			slog.Debug("Rejected banned peer", "peer", remoteAddr)
 			conn.Close()
 			continue
 		}
 
 		// Check inbound limit.
 		if n.inboundCount() >= MaxInboundPeers {
-			log.Printf("[P2P] Inbound limit reached, rejecting %s", remoteAddr)
+			slog.Debug("Inbound limit reached, rejecting", "peer", remoteAddr)
 			conn.Close()
 			continue
 		}
 
-		log.Printf("[P2P] Inbound connection from %s", remoteAddr)
+		slog.Debug("Inbound connection", "peer", remoteAddr)
 		peer := NewPeer(conn, true)
 		n.addPeer(peer)
 
@@ -327,10 +327,10 @@ func (n *Node) connectOutbound(addr string) {
 		return
 	}
 
-	log.Printf("[P2P] Connecting to %s...", addr)
+	slog.Debug("Connecting to peer", "peer", addr)
 	conn, err := net.DialTimeout("tcp", addr, HandshakeTimeout)
 	if err != nil {
-		log.Printf("[P2P] Failed to connect to %s: %v", addr, err)
+		slog.Debug("Failed to connect", "peer", addr, "error", err)
 		return
 	}
 
@@ -433,7 +433,7 @@ func (n *Node) banPeer(p *Peer) {
 	n.mu.Unlock()
 	p.Disconnect()
 	n.removePeer(p)
-	log.Printf("[P2P] Banned peer %s for %s", p.Addr, BanDuration)
+	slog.Warn("Peer banned", "peer", p.Addr, "duration", BanDuration)
 }
 
 // GetPeers returns addresses of all connected peers (for HTTP API compatibility).
@@ -464,17 +464,21 @@ func (n *Node) handlePeer(p *Peer) {
 	defer func() {
 		p.Disconnect()
 		n.removePeer(p)
-		log.Printf("[P2P] Peer %s disconnected", p.Addr)
+		slog.Debug("Peer disconnected", "peer", p.Addr)
 	}()
 
 	// Perform handshake.
 	if err := n.doHandshake(p); err != nil {
-		log.Printf("[P2P] Handshake with %s failed: %v", p.Addr, err)
+		slog.Debug("Handshake failed", "peer", p.Addr, "error", err)
 		return
 	}
 
-	log.Printf("[P2P] Peer %s connected (version: %d, height: %d, node: %s)",
-		p.Addr, p.Version, p.BestHeight, shortID(p.NodeID))
+	slog.Info("Peer connected",
+		"peer", p.Addr,
+		"version", p.Version,
+		"height", p.BestHeight,
+		"node_id", shortID(p.NodeID),
+	)
 
 	// Start ping loop.
 	n.wg.Add(1)
@@ -483,8 +487,11 @@ func (n *Node) handlePeer(p *Peer) {
 	// Trigger IBD if peer has more blocks.
 	localHeight := n.ledger.GetChainHeight()
 	if p.BestHeight > localHeight {
-		log.Printf("[P2P] Peer %s has more blocks (theirs: %d, ours: %d) — starting IBD",
-			p.Addr, p.BestHeight, localHeight)
+		slog.Info("Starting IBD from peer",
+			"peer", p.Addr,
+			"peer_height", p.BestHeight,
+			"local_height", localHeight,
+		)
 		n.requestBlocks(p)
 	}
 
@@ -504,12 +511,16 @@ func (n *Node) handlePeer(p *Peer) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			log.Printf("[P2P] Read error from %s: %v", p.Addr, err)
+			slog.Debug("Read error from peer", "peer", p.Addr, "error", err)
 			return
 		}
 
 		if err := n.handleMessage(p, msg); err != nil {
-			log.Printf("[P2P] Error handling %s from %s: %v", msg.Command, p.Addr, err)
+			slog.Debug("Error handling message",
+				"command", msg.Command,
+				"peer", p.Addr,
+				"error", err,
+			)
 			if banned := p.AddBanScore(10, err.Error()); banned {
 				n.banPeer(p)
 				return
@@ -676,7 +687,7 @@ func (n *Node) handleMessage(p *Peer, msg *Message) error {
 		// Duplicate verack — misbehaving.
 		return fmt.Errorf("unexpected duplicate verack message")
 	default:
-		log.Printf("[P2P] Unknown command from %s: %s", p.Addr, msg.Command)
+		slog.Debug("Unknown command from peer", "peer", p.Addr, "command", msg.Command)
 		return nil
 	}
 }
@@ -705,7 +716,7 @@ func (n *Node) pingLoop(p *Peer) {
 
 			msg, _ := NewMessage(CmdPing, &PingPayload{Nonce: nonce})
 			if err := p.Send(msg); err != nil {
-				log.Printf("[P2P] Ping to %s failed: %v", p.Addr, err)
+				slog.Debug("Ping failed", "peer", p.Addr, "error", err)
 				return
 			}
 		}
@@ -849,12 +860,16 @@ func (n *Node) handleTx(p *Peer, msg *Message) error {
 	// Submit to our ledger.
 	if err := n.ledger.SubmitTransaction(tx); err != nil {
 		// Not an error worth banning for — just log and skip.
-		log.Printf("[P2P] TX from %s rejected: %v", p.Addr, err)
+		slog.Debug("TX from peer rejected", "peer", p.Addr, "error", err)
 		return nil
 	}
 
-	log.Printf("[P2P] TX accepted from %s: %s -> %s (%.2f)",
-		p.Addr, shortAddr(tx.From), shortAddr(tx.To), tx.Amount)
+	slog.Info("TX accepted from peer",
+		"peer", p.Addr,
+		"from", shortAddr(tx.From),
+		"to", shortAddr(tx.To),
+		"amount", tx.Amount,
+	)
 
 	// Relay to other peers who don't know about it.
 	n.broadcastTx(&tx, p)
@@ -873,7 +888,7 @@ func (n *Node) broadcastTx(tx *block.Transaction, exclude *Peer) {
 	}
 	msg, err := NewMessage(CmdInv, inv)
 	if err != nil {
-		log.Printf("[P2P] Failed to create inv message for TX: %v", err)
+		slog.Error("Failed to create inv message for TX", "error", err)
 		return
 	}
 
@@ -903,8 +918,11 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 
 	p.MarkKnownBlock(b.Hash)
 
-	log.Printf("[P2P] Received block from %s: height=%d hash=%s",
-		p.Addr, b.Header.Height, shortHash(b.Hash))
+	slog.Debug("Received block from peer",
+		"peer", p.Addr,
+		"height", b.Header.Height,
+		"hash", shortHash(b.Hash),
+	)
 
 	// Try to add the block.
 	bc := n.ledger.GetChain()
@@ -913,8 +931,11 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 	if b.Header.Height != expectedHeight {
 		// Out of order — might need to request missing blocks.
 		if b.Header.Height > expectedHeight {
-			log.Printf("[P2P] Block %d from %s is ahead (expected %d) — requesting missing blocks",
-				b.Header.Height, p.Addr, expectedHeight)
+			slog.Debug("Block ahead, requesting missing blocks",
+				"block_height", b.Header.Height,
+				"peer", p.Addr,
+				"expected", expectedHeight,
+			)
 			n.requestBlocks(p)
 		}
 		return nil
@@ -922,15 +943,22 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 
 	// Validate and add block to chain via ledger.
 	if err := n.addBlockToLedger(&b); err != nil {
-		log.Printf("[P2P] Block %d from %s rejected: %v", b.Header.Height, p.Addr, err)
+		slog.Debug("Block rejected",
+			"height", b.Header.Height,
+			"peer", p.Addr,
+			"error", err,
+		)
 		if banned := p.AddBanScore(20, "invalid block"); banned {
 			n.banPeer(p)
 		}
 		return nil
 	}
 
-	log.Printf("[P2P] Block %d accepted from %s (hash: %s)",
-		b.Header.Height, p.Addr, shortHash(b.Hash))
+	slog.Info("Block accepted from peer",
+		"height", b.Header.Height,
+		"peer", p.Addr,
+		"hash", shortHash(b.Hash),
+	)
 
 	// Relay to other peers.
 	n.broadcastBlock(&b, p)
@@ -973,7 +1001,7 @@ func (n *Node) broadcastBlock(b *block.Block, exclude *Peer) {
 	}
 	msg, err := NewMessage(CmdInv, inv)
 	if err != nil {
-		log.Printf("[P2P] Failed to create inv message for block: %v", err)
+		slog.Error("Failed to create inv message for block", "error", err)
 		return
 	}
 
@@ -1007,12 +1035,12 @@ func (n *Node) requestBlocks(p *Peer) {
 
 	msg, err := NewMessage(CmdGetBlocks, payload)
 	if err != nil {
-		log.Printf("[P2P] Failed to create getblocks message: %v", err)
+		slog.Error("Failed to create getblocks message", "error", err)
 		return
 	}
 
 	if err := p.Send(msg); err != nil {
-		log.Printf("[P2P] Failed to send getblocks to %s: %v", p.Addr, err)
+		slog.Debug("Failed to send getblocks", "peer", p.Addr, "error", err)
 	}
 }
 

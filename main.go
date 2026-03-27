@@ -10,9 +10,12 @@
 //   - Faucet: 5,000 coins per request, global cap 11,000,000 (no per-address cooldown)
 //   - Mining rewards up to 10,000,000 (total supply cap: 21,000,000)
 //   - Ed25519 cryptography for transaction signing
-//   - HTTP API for wallet interactions
+//   - HTTP API for wallet interactions with rate limiting
+//   - Prometheus-compatible /metrics endpoint
 //   - Bitcoin-style TCP P2P protocol with binary message framing
 //   - P2P networking with chain synchronization
+//   - Structured logging via log/slog
+//   - Graceful shutdown with context cancellation
 //
 // Configuration is read from environment variables first, then CLI flags.
 // Environment variables take precedence over defaults but CLI flags override everything.
@@ -25,31 +28,29 @@
 //	FAUCET_KEY — hex-encoded Ed25519 private key     (optional)
 //	PEERS      — comma-separated list of HTTP peer URLs  (optional)
 //	TCP_PEERS  — comma-separated list of TCP peer addresses (host:port) (optional)
-//
-// CLI flags (override env vars):
-//
-//	-port        HTTP port to listen on
-//	-p2p-port    TCP P2P port to listen on
-//	-peers       Comma-separated list of HTTP peer URLs
-//	-tcp-peers   Comma-separated list of TCP peer addresses (host:port)
-//	-data        Path to the JSON storage file
-//	-faucet-key  Hex-encoded Ed25519 private key for the faucet wallet
+//	LOG_LEVEL  — log level: debug, info, warn, error (default: info)
+//	RATE_LIMIT — requests per second per IP           (default: 10)
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Bihan293/Noda/api"
 	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/ledger"
+	m "github.com/Bihan293/Noda/metrics"
 	"github.com/Bihan293/Noda/network"
 	"github.com/Bihan293/Noda/p2p"
+	"github.com/Bihan293/Noda/ratelimit"
 )
 
 // envOrDefault returns the value of the environment variable named by key,
@@ -69,6 +70,8 @@ func main() {
 	defaultFaucet := envOrDefault("FAUCET_KEY", "")
 	defaultPeers := envOrDefault("PEERS", "")
 	defaultTCPPeers := envOrDefault("TCP_PEERS", "")
+	defaultLogLevel := envOrDefault("LOG_LEVEL", "info")
+	defaultRateLimit := envOrDefault("RATE_LIMIT", "10")
 
 	// ---- CLI Flags (override env vars) ----
 	port := flag.String("port", defaultPort, "HTTP port for this node (env: PORT)")
@@ -77,7 +80,28 @@ func main() {
 	tcpPeersFlag := flag.String("tcp-peers", defaultTCPPeers, "Comma-separated TCP peer addresses host:port (env: TCP_PEERS)")
 	dataFile := flag.String("data", defaultData, "Path to JSON storage file (env: DATA_FILE)")
 	faucetKey := flag.String("faucet-key", defaultFaucet, "Hex-encoded Ed25519 private key for the faucet wallet (env: FAUCET_KEY)")
+	logLevel := flag.String("log-level", defaultLogLevel, "Log level: debug, info, warn, error (env: LOG_LEVEL)")
+	rateLimitFlag := flag.String("rate-limit", defaultRateLimit, "Requests per second per IP (env: RATE_LIMIT)")
 	flag.Parse()
+
+	// ---- Configure structured logging with slog ----
+	var level slog.Level
+	switch strings.ToLower(*logLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
 
 	// ---- Parse HTTP peers ----
 	var httpPeers []string
@@ -101,35 +125,67 @@ func main() {
 		}
 	}
 
+	// ---- Parse rate limit ----
+	ratePerSec, err := strconv.ParseFloat(*rateLimitFlag, 64)
+	if err != nil || ratePerSec <= 0 {
+		ratePerSec = 10
+	}
+	limiter := ratelimit.New(ratePerSec, int(ratePerSec*2))
+
 	// ---- Initialize components ----
-	log.Println("╔══════════════════════════════════════════════════════════════╗")
-	log.Println("║          Noda Crypto Node — Bitcoin-like                     ║")
-	log.Println("║   UTXO + Mempool + Faucet (11M cap) + TCP P2P              ║")
-	log.Println("╚══════════════════════════════════════════════════════════════╝")
-	log.Printf("  HTTP Port:     %s", *port)
-	log.Printf("  P2P Port:      %s", *p2pPort)
-	log.Printf("  Data:          %s", *dataFile)
-	log.Printf("  HTTP Peers:    %v", httpPeers)
-	log.Printf("  TCP Peers:     %v", tcpPeers)
+	slog.Info("╔══════════════════════════════════════════════════════════════╗")
+	slog.Info("║          Noda Crypto Node — Bitcoin-like v0.5.0            ║")
+	slog.Info("║   UTXO + Mempool + Faucet (11M cap) + TCP P2P + Metrics   ║")
+	slog.Info("╚══════════════════════════════════════════════════════════════╝")
+	slog.Info("Configuration",
+		"http_port", *port,
+		"p2p_port", *p2pPort,
+		"data_file", *dataFile,
+		"log_level", *logLevel,
+		"rate_limit", ratePerSec,
+		"http_peers", httpPeers,
+		"tcp_peers", tcpPeers,
+	)
 
 	// Load or create ledger (chain + UTXO + mempool).
 	l := ledger.LoadLedger(*dataFile)
-	log.Printf("  Chain:         %d blocks (height: %d)", l.GetChain().Len(), l.GetChainHeight())
-	log.Printf("  UTXO Set:      %d unspent outputs", l.UTXOSet.Size())
-	log.Printf("  Mempool:       %d pending transactions", l.GetMempoolSize())
-	log.Printf("  Block Reward:  %.2f coins", l.GetBlockReward())
-	log.Printf("  Max Supply:    %.0f coins (%.0f faucet + %.0f mining)",
-		block.MaxTotalSupply, block.GenesisSupply, block.MaxMiningSupply)
+
+	// Update metrics from initial state.
+	m.BlockHeight.Set(int64(l.GetChainHeight()))
+	m.BlockCount.Set(int64(l.GetChain().Len()))
+	m.UTXOCount.Set(int64(l.UTXOSet.Size()))
+	m.MempoolSize.Set(int64(l.GetMempoolSize()))
+	m.BlockReward.Set(l.GetBlockReward())
+	m.TotalMined.Set(l.GetChain().TotalMined)
+	m.TotalFaucet.Set(l.GetChain().TotalFaucet)
+
+	slog.Info("Ledger loaded",
+		"block_height", l.GetChainHeight(),
+		"blocks", l.GetChain().Len(),
+		"utxo_count", l.UTXOSet.Size(),
+		"mempool_size", l.GetMempoolSize(),
+		"block_reward", l.GetBlockReward(),
+		"max_supply", block.MaxTotalSupply,
+		"genesis_supply", block.GenesisSupply,
+		"mining_supply", block.MaxMiningSupply,
+	)
 
 	// Configure faucet wallet if key is provided.
 	if *faucetKey != "" {
 		if err := l.SetFaucetKey(*faucetKey); err != nil {
-			log.Fatalf("Faucet key error: %v", err)
+			slog.Error("Faucet key error", "error", err)
+			os.Exit(1)
 		}
-		log.Printf("  Faucet:        %s (balance: %.2f, remaining: %.0f)",
-			l.FaucetAddress(), l.GetBalance(l.FaucetAddress()), l.FaucetRemaining())
+		m.FaucetActive.Set(1)
+		m.FaucetRemaining.Set(l.FaucetRemaining())
+		slog.Info("Faucet configured",
+			"address", l.FaucetAddress(),
+			"balance", l.GetBalance(l.FaucetAddress()),
+			"remaining", l.FaucetRemaining(),
+		)
 	} else {
-		log.Println("  Faucet:        disabled (set FAUCET_KEY or use -faucet-key to enable)")
+		m.FaucetActive.Set(0)
+		slog.Info("Faucet disabled — set FAUCET_KEY or use -faucet-key to enable")
 	}
 
 	// Create the HTTP network layer with initial peers.
@@ -141,44 +197,62 @@ func main() {
 
 	p2pNode := p2p.NewNode(p2pPortNum, l, tcpPeers)
 	if err := p2pNode.Start(); err != nil {
-		log.Printf("[P2P] Warning: TCP P2P failed to start: %v", err)
+		slog.Warn("TCP P2P failed to start", "error", err)
 	} else {
 		// Link TCP node to the network layer.
 		net.SetTCPNode(p2pNode)
-		log.Printf("  P2P:           TCP listening on port %d", p2pPortNum)
+		slog.Info("P2P node started", "port", p2pPortNum)
 	}
 
 	// Attempt initial sync from HTTP peers.
 	if len(httpPeers) > 0 {
-		log.Println("[SYNC] Fetching chain from HTTP peers...")
+		slog.Info("Syncing chain from HTTP peers...")
 		if net.SyncChain(l) {
-			log.Printf("[SYNC] Chain updated from peers — height: %d, UTXO: %d",
-				l.GetChainHeight(), l.UTXOSet.Size())
+			slog.Info("Chain updated from peers",
+				"height", l.GetChainHeight(),
+				"utxo_count", l.UTXOSet.Size(),
+			)
 		} else {
-			log.Println("[SYNC] Local chain is up to date")
+			slog.Info("Local chain is up to date")
 		}
 	}
 
-	// ---- Start HTTP server ----
-	server := &api.Server{
-		Ledger:  l,
-		Network: net,
-		Port:    *port,
-	}
+	// ---- Context for graceful shutdown ----
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Handle graceful shutdown.
+	// Handle OS signals.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
-		log.Println("\n[SHUTDOWN] Signal received, shutting down...")
-		p2pNode.Stop()
-		log.Println("[SHUTDOWN] P2P node stopped")
+		sig := <-sigChan
+		slog.Info("Shutdown signal received", "signal", sig.String())
+		cancel()
+
+		// Give services 10 seconds to drain.
+		time.Sleep(10 * time.Second)
+		slog.Info("Forced shutdown")
 		os.Exit(0)
 	}()
 
-	if err := server.Start(); err != nil {
-		log.Fatalf("Server error: %v", err)
+	// ---- Start HTTP server ----
+	server := &api.Server{
+		Ledger:      l,
+		Network:     net,
+		Port:        *port,
+		RateLimiter: limiter,
 	}
+
+	slog.Info("Starting HTTP server", "port", *port)
+	if err := server.Start(ctx); err != nil {
+		slog.Error("Server error", "error", err)
+		p2pNode.Stop()
+		os.Exit(1)
+	}
+
+	// If Start returns without error, it means the context was cancelled.
+	slog.Info("Shutting down P2P node...")
+	p2pNode.Stop()
+	slog.Info("Shutdown complete")
 }
