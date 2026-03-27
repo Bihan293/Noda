@@ -5,6 +5,11 @@
 // - POST /transaction accepts raw signed transactions with explicit inputs/outputs
 // - POST /send uses the wallet-level builder to auto-select UTXOs
 // - POST /sign signs a transaction using the wallet-level builder
+//
+// CRITICAL-3: Transactions are no longer confirmed instantly.
+// - POST /transaction and POST /send return status "pending" + txid
+// - Mining happens asynchronously via the miner service
+// - GET /status shows mining info (enabled, address, last mined block)
 package api
 
 import (
@@ -20,6 +25,7 @@ import (
 	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/ledger"
 	m "github.com/Bihan293/Noda/metrics"
+	"github.com/Bihan293/Noda/miner"
 	"github.com/Bihan293/Noda/network"
 	"github.com/Bihan293/Noda/ratelimit"
 )
@@ -30,6 +36,7 @@ type Server struct {
 	Network     *network.Network
 	Port        string
 	RateLimiter *ratelimit.Limiter
+	Miner       *miner.Miner // CRITICAL-3: background miner reference
 }
 
 // ---------- Helpers ----------
@@ -150,7 +157,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"node":    "noda",
-		"version": "0.6.0",
+		"version": "0.7.0",
 	})
 }
 
@@ -176,6 +183,7 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 
 // handleTransaction processes a pre-signed raw UTXO transaction.
 // POST /transaction — body: {version, inputs, outputs, lock_time}
+// CRITICAL-3: Returns status "pending" — tx goes to mempool, NOT mined instantly.
 func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -214,9 +222,11 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	// Broadcast the valid transaction to all peers.
 	go s.Network.BroadcastTransaction(tx)
 
-	jsonResponse(w, http.StatusCreated, map[string]string{
-		"message": "transaction accepted",
-		"txid":    tx.ID,
+	jsonResponse(w, http.StatusCreated, map[string]interface{}{
+		"message":       "transaction accepted",
+		"txid":          tx.ID,
+		"status":        "pending",
+		"confirmations": 0,
 	})
 }
 
@@ -307,6 +317,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 // handleStatus returns node status including block height, mining info, mempool, UTXO, and faucet state.
 // GET /status
+// CRITICAL-3: Now includes mining_enabled, miner_address, last_mined_block_hash.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		errorResponse(w, http.StatusMethodNotAllowed, "GET only")
@@ -315,7 +326,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
 		"port":                  s.Port,
-		"version":               "0.6.0",
+		"version":               "0.7.0",
 		"tx_model":              "utxo_inputs_outputs",
 		"block_height":          ch.Height(),
 		"chain_length":          ch.Len(),
@@ -333,6 +344,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"faucet_owner_match":    s.Ledger.FaucetOwnerMatch(),
 		"usable_faucet_balance": s.Ledger.UsableFaucetBalance(),
 	}
+
+	// Mining info (CRITICAL-3).
+	if s.Miner != nil {
+		resp["mining_enabled"] = s.Miner.IsEnabled()
+		resp["miner_address"] = s.Miner.MinerAddress()
+		resp["last_mined_block_hash"] = s.Miner.LastMinedHash()
+		resp["blocks_mined_by_node"] = s.Miner.BlocksMined()
+	} else {
+		resp["mining_enabled"] = false
+		resp["miner_address"] = ""
+		resp["last_mined_block_hash"] = ""
+		resp["blocks_mined_by_node"] = 0
+	}
+
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
 		resp["faucet_owner"] = addr
@@ -417,8 +442,9 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSend is the all-in-one endpoint: build + sign + validate + chain + broadcast.
+// handleSend is the all-in-one endpoint: build + sign + validate + mempool + broadcast.
 // POST /send — body: {from, to, amount, private_key}
+// CRITICAL-3: Returns status "pending" — tx goes to mempool, NOT confirmed instantly.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -485,18 +511,20 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	go s.Network.BroadcastTransaction(*tx)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":     "transaction sent",
-		"txid":        tx.ID,
-		"from":        from,
-		"to":          req.To,
-		"amount":      req.Amount,
-		"new_balance": s.Ledger.GetBalance(from),
+		"message":       "transaction accepted",
+		"txid":          tx.ID,
+		"from":          from,
+		"to":            req.To,
+		"amount":        req.Amount,
+		"status":        "pending",
+		"confirmations": 0,
 	})
 }
 
 // handleFaucet sends free coins to a given address.
 // POST /faucet — body: {"to": "..."}
 // No per-address cooldown — only global 11M cap applies.
+// CRITICAL-3: Faucet tx goes to mempool, confirmed asynchronously by miner.
 func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -529,11 +557,12 @@ func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	go s.Network.BroadcastTransaction(*tx)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":          fmt.Sprintf("%.0f coins sent from faucet", tx.Outputs[0].Amount),
+		"message":          fmt.Sprintf("%.0f coins sent from faucet (pending confirmation)", tx.Outputs[0].Amount),
 		"to":               req.To,
 		"amount":           tx.Outputs[0].Amount,
 		"txid":             tx.ID,
-		"new_balance":      s.Ledger.GetBalance(req.To),
+		"status":           "pending",
+		"confirmations":    0,
 		"faucet_remaining": s.Ledger.FaucetRemaining(),
 	})
 }

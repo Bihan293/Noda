@@ -4,16 +4,18 @@
 // in a block. It supports:
 //   - Thread-safe concurrent access
 //   - Transaction validation before admission (signature, double-spend via UTXO)
-//   - Priority ordering by arrival time (FIFO)
-//   - Configurable pool size limit with eviction (oldest first)
+//   - Priority ordering by fee rate, then arrival time (FIFO) for equal fees
+//   - Configurable pool size limit with eviction (lowest fee first)
 //   - Removal of transactions once they are included in a block
 //   - Querying pending transactions for block assembly
 //   - Double-spend detection based on explicit input outpoints (CRITICAL-2)
+//   - Fee tracking per transaction (CRITICAL-3)
 package mempool
 
 import (
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -41,6 +43,8 @@ type Entry struct {
 	Tx       block.Transaction `json:"tx"`
 	AddedAt  time.Time         `json:"added_at"`  // when the TX was added to the pool
 	Priority int64             `json:"priority"`   // arrival order (lower = earlier = higher priority)
+	Fee      float64           `json:"fee"`        // transaction fee = sum(inputs) - sum(outputs)
+	FeeRate  float64           `json:"fee_rate"`   // fee per byte (fee / estimated_size) — simplified to fee for now
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -75,11 +79,11 @@ func New(maxSize int) *Mempool {
 // Add / Remove
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Add inserts a transaction into the mempool.
-// The transaction must already have a valid ID set.
+// AddWithFee inserts a transaction into the mempool with an explicit fee amount.
+// The fee should be pre-computed by the caller (sum(inputs) - sum(outputs)).
 // Returns an error if the transaction is a duplicate, spends an already-spent
 // outpoint, or the pool is full after eviction.
-func (mp *Mempool) Add(tx block.Transaction) error {
+func (mp *Mempool) AddWithFee(tx block.Transaction, fee float64) error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
@@ -117,6 +121,8 @@ func (mp *Mempool) Add(tx block.Transaction) error {
 		Tx:       tx,
 		AddedAt:  time.Now(),
 		Priority: mp.sequence,
+		Fee:      fee,
+		FeeRate:  fee, // simplified: fee rate = fee (no byte-size calculation yet)
 	}
 
 	mp.entries[tx.ID] = entry
@@ -129,7 +135,7 @@ func (mp *Mempool) Add(tx block.Transaction) error {
 	}
 
 	// Build log description.
-	desc := fmt.Sprintf("inputs=%d outputs=%d", len(tx.Inputs), len(tx.Outputs))
+	desc := fmt.Sprintf("inputs=%d outputs=%d fee=%.8f", len(tx.Inputs), len(tx.Outputs), fee)
 	if tx.IsCoinbase() {
 		desc = "coinbase"
 	}
@@ -137,6 +143,14 @@ func (mp *Mempool) Add(tx block.Transaction) error {
 		shortID(tx.ID), desc, len(mp.entries))
 
 	return nil
+}
+
+// Add inserts a transaction into the mempool with zero fee (backward-compatible).
+// The transaction must already have a valid ID set.
+// Returns an error if the transaction is a duplicate, spends an already-spent
+// outpoint, or the pool is full after eviction.
+func (mp *Mempool) Add(tx block.Transaction) error {
+	return mp.AddWithFee(tx, 0)
 }
 
 // Remove deletes a transaction from the mempool (e.g., after block inclusion).
@@ -201,6 +215,17 @@ func (mp *Mempool) Get(txID string) *block.Transaction {
 	return &tx
 }
 
+// GetFee returns the fee for a transaction in the mempool. Returns 0 if not found.
+func (mp *Mempool) GetFee(txID string) float64 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	entry, ok := mp.entries[txID]
+	if !ok {
+		return 0
+	}
+	return entry.Fee
+}
+
 // Size returns the number of transactions currently in the pool.
 func (mp *Mempool) Size() int {
 	mp.mu.RLock()
@@ -208,27 +233,58 @@ func (mp *Mempool) Size() int {
 	return len(mp.entries)
 }
 
-// GetPending returns up to `limit` pending transactions in FIFO order.
+// GetPending returns up to `limit` pending transactions ordered by fee rate
+// (descending), then by arrival time (FIFO) for equal fees.
 // These are candidates for inclusion in the next block.
 func (mp *Mempool) GetPending(limit int) []block.Transaction {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
 
-	result := make([]block.Transaction, 0, min(limit, len(mp.order)))
-	for _, id := range mp.order {
+	if len(mp.entries) == 0 {
+		return nil
+	}
+
+	// Collect entries for sorting.
+	type sortEntry struct {
+		id       string
+		fee      float64
+		priority int64
+	}
+	entries := make([]sortEntry, 0, len(mp.entries))
+	for id, e := range mp.entries {
+		entries = append(entries, sortEntry{
+			id:       id,
+			fee:      e.Fee,
+			priority: e.Priority,
+		})
+	}
+
+	// Sort by fee descending, then by arrival order ascending (FIFO).
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].fee != entries[j].fee {
+			return entries[i].fee > entries[j].fee // higher fee first
+		}
+		return entries[i].priority < entries[j].priority // earlier arrival first
+	})
+
+	result := make([]block.Transaction, 0, min(limit, len(entries)))
+	for _, se := range entries {
 		if len(result) >= limit {
 			break
 		}
-		if entry, ok := mp.entries[id]; ok {
+		if entry, ok := mp.entries[se.id]; ok {
 			result = append(result, entry.Tx)
 		}
 	}
 	return result
 }
 
-// GetAll returns all pending transactions in FIFO order.
+// GetAll returns all pending transactions ordered by fee rate then FIFO.
 func (mp *Mempool) GetAll() []block.Transaction {
-	return mp.GetPending(len(mp.order))
+	mp.mu.RLock()
+	n := len(mp.entries)
+	mp.mu.RUnlock()
+	return mp.GetPending(n)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

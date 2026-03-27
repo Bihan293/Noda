@@ -401,9 +401,14 @@ func TestFaucetWorksWithMatchingKey(t *testing.T) {
 		}
 	}
 
-	recipientBalance := l.GetBalance(recipient.Address)
-	if recipientBalance != FaucetAmount {
-		t.Errorf("recipient balance = %f, want %f", recipientBalance, FaucetAmount)
+	// CRITICAL-3: tx is in mempool, not yet confirmed. Balance changes happen after mining.
+	if l.GetMempoolSize() != 1 {
+		t.Errorf("mempool size = %d, want 1 (faucet tx pending)", l.GetMempoolSize())
+	}
+
+	// Faucet tracking should already be updated.
+	if l.FaucetTotalDistributed() != FaucetAmount {
+		t.Errorf("FaucetTotalDistributed() = %f, want %f", l.FaucetTotalDistributed(), FaucetAmount)
 	}
 }
 

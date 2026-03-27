@@ -13,6 +13,10 @@
 // automatically selects UTXOs for convenience, but the consensus layer
 // only sees explicit inputs/outputs.
 //
+// CRITICAL-3: Transaction submission is decoupled from mining.
+// SubmitTransaction only validates and adds to mempool.
+// Mining is performed by the separate miner package.
+//
 // Genesis ownership:
 //
 //	The genesis supply (11M) is assigned to an address derived from the configured
@@ -119,6 +123,53 @@ func NewLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
 		"utxo_count", utxoSet.Size(),
 	)
 	return l
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ChainAccess interface — used by the miner package (CRITICAL-3)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// UTXOSetRef returns a pointer to the UTXO set.
+func (l *Ledger) UTXOSetRef() *utxo.Set {
+	return l.UTXOSet
+}
+
+// MempoolRef returns a pointer to the mempool.
+func (l *Ledger) MempoolRef() *mempool.Mempool {
+	return l.Mempool
+}
+
+// ApplyMinedBlock applies a mined block to chain + UTXO, removes mempool txs, persists.
+// This is called by the miner after successfully mining a block.
+func (l *Ledger) ApplyMinedBlock(b *block.Block, txIDs []string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Add block to chain.
+	if err := l.Chain.AddBlock(b); err != nil {
+		return fmt.Errorf("failed to add mined block: %w", err)
+	}
+
+	// Apply block to UTXO set.
+	if err := l.UTXOSet.ApplyBlock(b); err != nil {
+		return fmt.Errorf("UTXO update failed for mined block: %w", err)
+	}
+
+	// Remove confirmed transactions from mempool.
+	l.Mempool.RemoveBatch(txIDs)
+
+	// Update balance cache from UTXO.
+	l.Balances = l.UTXOSet.AllBalances()
+
+	// Persist.
+	_ = l.saveLocked()
+
+	slog.Info("Mined block applied",
+		"height", b.Header.Height,
+		"txs", len(b.Transactions),
+		"utxo_size", l.UTXOSet.Size(),
+	)
+	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -400,11 +451,34 @@ func (l *Ledger) BuildTransaction(privateKeyHex, fromAddr, toAddr string, amount
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Transaction Fee Computation (CRITICAL-3)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ComputeTxFee computes the transaction fee from the UTXO set.
+// fee = sum(input values from UTXO) - sum(output values)
+// Returns the fee and an error if any input is not found.
+func (l *Ledger) ComputeTxFee(tx block.Transaction) (float64, error) {
+	var totalInput float64
+	for i, in_ := range tx.Inputs {
+		op := utxo.OutPoint{TxID: in_.PrevTxID, Index: in_.PrevIndex}
+		utxoOut := l.UTXOSet.Get(op)
+		if utxoOut == nil {
+			return 0, fmt.Errorf("input %d: utxo %s:%d not found", i, shortAddr(in_.PrevTxID), in_.PrevIndex)
+		}
+		totalInput += utxoOut.Amount
+	}
+	totalOutput := tx.TotalOutputValue()
+	fee := totalInput - totalOutput
+	return fee, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Transaction Validation (CRITICAL-2: explicit inputs/outputs)
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ValidateUserTx checks a user-submitted transaction without applying it.
-// Validates: outputs, inputs (UTXO existence, amounts), signature (sighash).
+// Validates: outputs, inputs (UTXO existence, amounts), signature (sighash),
+// and ensures fee is non-negative (CRITICAL-3).
 func (l *Ledger) ValidateUserTx(tx block.Transaction) error {
 	// Must have at least one input and one output.
 	if len(tx.Inputs) == 0 {
@@ -454,10 +528,10 @@ func (l *Ledger) ValidateUserTx(tx block.Transaction) error {
 		}
 	}
 
-	// Total outputs must not exceed total inputs.
+	// Total outputs must not exceed total inputs (fee >= 0).
 	totalOutput := tx.TotalOutputValue()
 	if totalOutput > totalInput {
-		return fmt.Errorf("output total (%.6f) exceeds input total (%.6f)", totalOutput, totalInput)
+		return fmt.Errorf("output total (%.6f) exceeds input total (%.6f) — negative fee not allowed", totalOutput, totalInput)
 	}
 
 	// Signature verification using sighash.
@@ -473,11 +547,12 @@ func (l *Ledger) ValidateUserTx(tx block.Transaction) error {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Transaction Processing
+// Transaction Processing (CRITICAL-3: decoupled from mining)
 // ──────────────────────────────────────────────────────────────────────────────
 
 // SubmitTransaction validates a user transaction and adds it to the mempool.
-// Then creates a block containing the transaction (single-tx block for now).
+// CRITICAL-3: does NOT mine a block — transactions stay in mempool until the
+// miner worker picks them up.
 func (l *Ledger) SubmitTransaction(tx block.Transaction) error {
 	// Validate the transaction.
 	if err := l.ValidateUserTx(tx); err != nil {
@@ -489,17 +564,27 @@ func (l *Ledger) SubmitTransaction(tx block.Transaction) error {
 		tx.ID = block.HashTransaction(&tx)
 	}
 
-	// Add to mempool.
-	if err := l.Mempool.Add(tx); err != nil {
+	// Compute the transaction fee.
+	fee, err := l.ComputeTxFee(tx)
+	if err != nil {
+		return fmt.Errorf("fee computation failed: %w", err)
+	}
+	if fee < 0 {
+		return fmt.Errorf("negative fee (%.6f) not allowed", fee)
+	}
+
+	// Add to mempool with fee information.
+	if err := l.Mempool.AddWithFee(tx, fee); err != nil {
 		return fmt.Errorf("mempool rejection: %w", err)
 	}
 
-	// Mine a block containing this transaction.
-	if err := l.mineBlockWithTx(tx); err != nil {
-		// Remove from mempool on failure.
-		l.Mempool.Remove(tx.ID)
-		return err
-	}
+	slog.Info("TX accepted to mempool",
+		"txid", shortAddr(tx.ID),
+		"inputs", len(tx.Inputs),
+		"outputs", len(tx.Outputs),
+		"fee", fee,
+		"status", "pending",
+	)
 
 	return nil
 }
@@ -509,63 +594,6 @@ func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
 	return l.SubmitTransaction(tx)
 }
 
-// mineBlockWithTx creates and mines a block containing a single transaction.
-func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	txIDs := []string{tx.ID}
-	merkleRoot := block.ComputeMerkleRoot(txIDs)
-
-	nextHeight := l.Chain.Height() + 1
-	prevHash := l.Chain.LastHash()
-	target := l.Chain.GetTarget()
-
-	newBlock := &block.Block{
-		Header: block.BlockHeader{
-			Version:       block.BlockVersion,
-			Height:        nextHeight,
-			PrevBlockHash: prevHash,
-			MerkleRoot:    merkleRoot,
-			Timestamp:     l.Chain.LastBlock().Header.Timestamp + 600,
-			Bits:          block.BitsFromTarget(target),
-		},
-		Transactions: []block.Transaction{tx},
-	}
-
-	// Mine the block.
-	if err := block.MineBlock(newBlock, target, 10_000_000); err != nil {
-		return fmt.Errorf("mining failed for user tx block: %w", err)
-	}
-
-	// Add block to chain.
-	if err := l.Chain.AddBlock(newBlock); err != nil {
-		return fmt.Errorf("failed to add block: %w", err)
-	}
-
-	// Apply block to UTXO set.
-	if err := l.UTXOSet.ApplyBlock(newBlock); err != nil {
-		return fmt.Errorf("UTXO update failed: %w", err)
-	}
-
-	// Remove transaction from mempool.
-	l.Mempool.Remove(tx.ID)
-
-	// Update balance cache from UTXO.
-	l.Balances = l.UTXOSet.AllBalances()
-
-	slog.Info("TX accepted",
-		"inputs", len(tx.Inputs),
-		"outputs", len(tx.Outputs),
-		"block_height", newBlock.Header.Height,
-		"utxo_size", l.UTXOSet.Size(),
-	)
-
-	// Persist.
-	_ = l.saveLocked()
-	return nil
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Faucet — Global cap 11M, 5000 coins/request, no per-address cooldown
 // ──────────────────────────────────────────────────────────────────────────────
@@ -573,6 +601,7 @@ func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
 // ProcessFaucet sends FaucetAmount coins from the faucet wallet to the given address.
 // Enforces only the global faucet cap (11M total). No per-address cooldown.
 // Multiple claims allowed from any address until the global cap is reached.
+// CRITICAL-3: Faucet transactions now go through the mempool like any other transaction.
 func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 	// Check faucet is configured.
 	if l.faucetPrivKey == "" || l.faucetAddress == "" {
@@ -620,7 +649,7 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		return nil, fmt.Errorf("faucet transaction build failed: %w", err)
 	}
 
-	// Process through normal validation (creates a block).
+	// Submit through normal validation (adds to mempool, no mining).
 	if err := l.SubmitTransaction(*tx); err != nil {
 		return nil, fmt.Errorf("faucet transaction failed: %w", err)
 	}
@@ -635,6 +664,7 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		"amount", amount,
 		"total_distributed", totalDistributed+amount,
 		"global_cap", FaucetGlobalCap,
+		"status", "pending",
 	)
 
 	return tx, nil

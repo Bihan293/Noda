@@ -7,6 +7,8 @@
 //   - Block reward with halving (50 coins, halving every 210,000 blocks)
 //   - UTXO set for balance tracking and double-spend prevention
 //   - Mempool for unconfirmed transaction management
+//   - Background miner: block template assembly from mempool + PoW (CRITICAL-3)
+//   - Transaction fees: sum(inputs) - sum(outputs), collected by miner (CRITICAL-3)
 //   - Faucet: 5,000 coins per request, global cap 11,000,000 (no per-address cooldown)
 //   - Mining rewards up to 10,000,000 (total supply cap: 21,000,000)
 //   - Ed25519 cryptography for transaction signing
@@ -22,14 +24,19 @@
 //
 // Environment variables:
 //
-//	PORT       — HTTP port to listen on              (default: 3000)
-//	P2P_PORT   — TCP P2P port to listen on           (default: 9333)
-//	DATA_FILE  — path to the JSON storage file       (default: node_data.json)
-//	FAUCET_KEY — hex-encoded Ed25519 private key     (optional)
-//	PEERS      — comma-separated list of HTTP peer URLs  (optional)
-//	TCP_PEERS  — comma-separated list of TCP peer addresses (host:port) (optional)
-//	LOG_LEVEL  — log level: debug, info, warn, error (default: info)
-//	RATE_LIMIT — requests per second per IP           (default: 10)
+//	PORT               — HTTP port to listen on              (default: 3000)
+//	P2P_PORT           — TCP P2P port to listen on           (default: 9333)
+//	DATA_FILE          — path to the JSON storage file       (default: node_data.json)
+//	FAUCET_KEY         — hex-encoded Ed25519 private key     (optional)
+//	PEERS              — comma-separated list of HTTP peer URLs  (optional)
+//	TCP_PEERS          — comma-separated list of TCP peer addresses (host:port) (optional)
+//	LOG_LEVEL          — log level: debug, info, warn, error (default: info)
+//	RATE_LIMIT         — requests per second per IP           (default: 10)
+//	MINING_ENABLED     — enable background mining             (default: true if MINER_ADDRESS set)
+//	MINER_ADDRESS      — address to receive mining rewards    (optional)
+//	BLOCK_MAX_TX       — max transactions per block           (default: 100)
+//	MINING_INTERVAL_MS — interval between mining attempts ms  (default: 5000)
+//	MINING_MAX_ATTEMPTS — max PoW nonce attempts per block    (default: 10000000)
 package main
 
 import (
@@ -49,6 +56,7 @@ import (
 	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/ledger"
 	m "github.com/Bihan293/Noda/metrics"
+	"github.com/Bihan293/Noda/miner"
 	"github.com/Bihan293/Noda/network"
 	"github.com/Bihan293/Noda/p2p"
 	"github.com/Bihan293/Noda/ratelimit"
@@ -74,6 +82,13 @@ func main() {
 	defaultLogLevel := envOrDefault("LOG_LEVEL", "info")
 	defaultRateLimit := envOrDefault("RATE_LIMIT", "10")
 
+	// Mining defaults (CRITICAL-3).
+	defaultMiningEnabled := envOrDefault("MINING_ENABLED", "")
+	defaultMinerAddress := envOrDefault("MINER_ADDRESS", "")
+	defaultBlockMaxTx := envOrDefault("BLOCK_MAX_TX", "100")
+	defaultMiningInterval := envOrDefault("MINING_INTERVAL_MS", "5000")
+	defaultMiningMaxAttempts := envOrDefault("MINING_MAX_ATTEMPTS", "10000000")
+
 	// ---- CLI Flags (override env vars) ----
 	port := flag.String("port", defaultPort, "HTTP port for this node (env: PORT)")
 	p2pPort := flag.String("p2p-port", defaultP2PPort, "TCP P2P port for this node (env: P2P_PORT)")
@@ -83,6 +98,14 @@ func main() {
 	faucetKey := flag.String("faucet-key", defaultFaucet, "Hex-encoded Ed25519 private key for the faucet wallet (env: FAUCET_KEY)")
 	logLevel := flag.String("log-level", defaultLogLevel, "Log level: debug, info, warn, error (env: LOG_LEVEL)")
 	rateLimitFlag := flag.String("rate-limit", defaultRateLimit, "Requests per second per IP (env: RATE_LIMIT)")
+
+	// Mining flags (CRITICAL-3).
+	miningEnabledFlag := flag.String("mining-enabled", defaultMiningEnabled, "Enable background mining (env: MINING_ENABLED)")
+	minerAddressFlag := flag.String("miner-address", defaultMinerAddress, "Address to receive mining rewards (env: MINER_ADDRESS)")
+	blockMaxTxFlag := flag.String("block-max-tx", defaultBlockMaxTx, "Max transactions per block (env: BLOCK_MAX_TX)")
+	miningIntervalFlag := flag.String("mining-interval", defaultMiningInterval, "Mining attempt interval in ms (env: MINING_INTERVAL_MS)")
+	miningMaxAttemptsFlag := flag.String("mining-max-attempts", defaultMiningMaxAttempts, "Max PoW nonce attempts (env: MINING_MAX_ATTEMPTS)")
+
 	flag.Parse()
 
 	// ---- Configure structured logging with slog ----
@@ -135,8 +158,8 @@ func main() {
 
 	// ---- Initialize components ----
 	slog.Info("╔══════════════════════════════════════════════════════════════╗")
-	slog.Info("║          Noda Crypto Node — Bitcoin-like v0.6.0            ║")
-	slog.Info("║  UTXO I/O + Mempool + Faucet (11M cap) + TCP P2P + Metrics║")
+	slog.Info("║          Noda Crypto Node — Bitcoin-like v0.7.0            ║")
+	slog.Info("║  UTXO I/O + Mempool + Miner + Fees + Faucet + TCP P2P    ║")
 	slog.Info("╚══════════════════════════════════════════════════════════════╝")
 	slog.Info("Configuration",
 		"http_port", *port,
@@ -205,6 +228,41 @@ func main() {
 		slog.Info("Faucet disabled — set FAUCET_KEY or use -faucet-key to enable")
 	}
 
+	// ---- Configure Miner (CRITICAL-3) ----
+	minerCfg := miner.DefaultConfig()
+	minerCfg.MinerAddress = *minerAddressFlag
+
+	// Parse mining enabled flag.
+	switch strings.ToLower(*miningEnabledFlag) {
+	case "true", "1", "yes":
+		minerCfg.Enabled = true
+	case "false", "0", "no":
+		minerCfg.Enabled = false
+	default:
+		// Auto: enable if MINER_ADDRESS is set.
+		minerCfg.Enabled = minerCfg.MinerAddress != ""
+	}
+
+	if v, err := strconv.Atoi(*blockMaxTxFlag); err == nil && v > 0 {
+		minerCfg.BlockMaxTx = v
+	}
+	if v, err := strconv.ParseInt(*miningIntervalFlag, 10, 64); err == nil && v > 0 {
+		minerCfg.Interval = time.Duration(v) * time.Millisecond
+	}
+	if v, err := strconv.ParseUint(*miningMaxAttemptsFlag, 10, 64); err == nil && v > 0 {
+		minerCfg.MaxAttempts = v
+	}
+
+	minerWorker := miner.New(minerCfg, l)
+
+	slog.Info("Miner configuration",
+		"enabled", minerCfg.Enabled,
+		"address", minerCfg.MinerAddress,
+		"block_max_tx", minerCfg.BlockMaxTx,
+		"interval", minerCfg.Interval,
+		"max_attempts", minerCfg.MaxAttempts,
+	)
+
 	// Create the HTTP network layer with initial peers.
 	net := network.NewNetwork(httpPeers)
 
@@ -253,12 +311,16 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// ---- Start Background Miner (CRITICAL-3) ----
+	go minerWorker.Run(ctx)
+
 	// ---- Start HTTP server ----
 	server := &api.Server{
 		Ledger:      l,
 		Network:     net,
 		Port:        *port,
 		RateLimiter: limiter,
+		Miner:       minerWorker,
 	}
 
 	slog.Info("Starting HTTP server", "port", *port)
