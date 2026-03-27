@@ -31,7 +31,7 @@ func newTestServer(t *testing.T) *Server {
 func TestHandleBalance(t *testing.T) {
 	s := newTestServer(t)
 
-	req := httptest.NewRequest("GET", "/balance?address="+block.GenesisAddress, nil)
+	req := httptest.NewRequest("GET", "/balance?address="+block.LegacyGenesisAddress, nil)
 	w := httptest.NewRecorder()
 
 	s.handleBalance(w, req)
@@ -42,8 +42,8 @@ func TestHandleBalance(t *testing.T) {
 
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["address"] != block.GenesisAddress {
-		t.Errorf("address = %v, want %s", resp["address"], block.GenesisAddress)
+	if resp["address"] != block.LegacyGenesisAddress {
+		t.Errorf("address = %v, want %s", resp["address"], block.LegacyGenesisAddress)
 	}
 	if resp["balance"].(float64) != block.GenesisSupply {
 		t.Errorf("balance = %v, want %f", resp["balance"], block.GenesisSupply)
@@ -172,6 +172,16 @@ func TestHandleStatus(t *testing.T) {
 	}
 	if resp["utxo_count"] == nil {
 		t.Error("response should contain 'utxo_count'")
+	}
+	// [CRITICAL-1] New genesis/faucet ownership fields.
+	if resp["genesis_owner"] == nil {
+		t.Error("response should contain 'genesis_owner'")
+	}
+	if _, ok := resp["faucet_owner_match"]; !ok {
+		t.Error("response should contain 'faucet_owner_match'")
+	}
+	if _, ok := resp["usable_faucet_balance"]; !ok {
+		t.Error("response should contain 'usable_faucet_balance'")
 	}
 }
 

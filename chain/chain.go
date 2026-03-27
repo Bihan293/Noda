@@ -15,30 +15,39 @@ import (
 
 // Blockchain is an ordered list of blocks forming the ledger.
 type Blockchain struct {
-	Blocks      []*block.Block `json:"blocks"`
-	TotalMined  float64        `json:"total_mined"`  // total coins created via mining rewards
-	TotalFaucet float64        `json:"total_faucet"`  // total coins distributed via faucet
-	Target      *big.Int       `json:"-"`             // current difficulty target (not serialized directly)
-	TargetHex   string         `json:"target_hex"`    // hex-serialized target for JSON persistence
-	mu          sync.RWMutex
+	Blocks       []*block.Block `json:"blocks"`
+	TotalMined   float64        `json:"total_mined"`   // total coins created via mining rewards
+	TotalFaucet  float64        `json:"total_faucet"`   // total coins distributed via faucet
+	GenesisOwner string         `json:"genesis_owner"` // address that owns the genesis supply
+	Target       *big.Int       `json:"-"`              // current difficulty target (not serialized directly)
+	TargetHex    string         `json:"target_hex"`     // hex-serialized target for JSON persistence
+	mu           sync.RWMutex
 }
 
-// NewBlockchain creates a new blockchain with the genesis block.
+// NewBlockchain creates a new blockchain with the genesis block using the legacy address.
+// New code should use NewBlockchainWithOwner.
 func NewBlockchain() *Blockchain {
+	return NewBlockchainWithOwner(block.LegacyGenesisAddress)
+}
+
+// NewBlockchainWithOwner creates a new blockchain with the genesis block where the
+// initial supply goes to the specified owner address.
+func NewBlockchainWithOwner(genesisOwner string) *Blockchain {
 	bc := &Blockchain{
-		Blocks:    make([]*block.Block, 0),
-		Target:    new(big.Int).Set(block.InitialTarget),
-		TargetHex: block.BitsFromTarget(block.InitialTarget),
+		Blocks:       make([]*block.Block, 0),
+		GenesisOwner: genesisOwner,
+		Target:       new(big.Int).Set(block.InitialTarget),
+		TargetHex:    block.BitsFromTarget(block.InitialTarget),
 	}
-	bc.addGenesis()
+	bc.addGenesis(genesisOwner)
 	return bc
 }
 
 // addGenesis appends the genesis block.
-func (bc *Blockchain) addGenesis() {
-	genesis := block.NewGenesisBlock()
+func (bc *Blockchain) addGenesis(ownerAddress string) {
+	genesis := block.NewGenesisBlockWithOwner(ownerAddress)
 	bc.Blocks = append(bc.Blocks, genesis)
-	slog.Info("Genesis block created", "hash", genesis.Hash[:16])
+	slog.Info("Genesis block created", "hash", genesis.Hash[:16], "genesis_owner", ownerAddress)
 }
 
 // Height returns the height of the last block (0-indexed).

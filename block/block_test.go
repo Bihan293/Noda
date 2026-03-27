@@ -392,8 +392,8 @@ func TestNewGenesisBlock(t *testing.T) {
 	if genesis.Transactions[0].Amount != GenesisSupply {
 		t.Errorf("genesis TX amount = %f, want %f", genesis.Transactions[0].Amount, GenesisSupply)
 	}
-	if genesis.Transactions[0].To != GenesisAddress {
-		t.Errorf("genesis TX to = %s, want %s", genesis.Transactions[0].To, GenesisAddress)
+	if genesis.Transactions[0].To != LegacyGenesisAddress {
+		t.Errorf("genesis TX to = %s, want %s", genesis.Transactions[0].To, LegacyGenesisAddress)
 	}
 	if genesis.Transactions[0].Signature != "genesis" {
 		t.Errorf("genesis TX signature = %q, want %q", genesis.Transactions[0].Signature, "genesis")
@@ -482,5 +482,88 @@ func TestValidateBlock_NoTransactions(t *testing.T) {
 		"0000000000000000000000000000000000000000000000000000000000000000", 0)
 	if err == nil {
 		t.Error("ValidateBlock() should fail for block with no transactions")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// [CRITICAL-1] NewGenesisBlockWithOwner & GenesisOwnerFromBlock
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestNewGenesisBlockWithOwner(t *testing.T) {
+	customAddr := "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+	genesis := NewGenesisBlockWithOwner(customAddr)
+
+	if genesis == nil {
+		t.Fatal("NewGenesisBlockWithOwner() returned nil")
+	}
+	if genesis.Header.Height != 0 {
+		t.Errorf("genesis height = %d, want 0", genesis.Header.Height)
+	}
+	if genesis.Transactions[0].To != customAddr {
+		t.Errorf("genesis TX to = %s, want %s", genesis.Transactions[0].To, customAddr)
+	}
+	if genesis.Transactions[0].Amount != GenesisSupply {
+		t.Errorf("genesis TX amount = %f, want %f", genesis.Transactions[0].Amount, GenesisSupply)
+	}
+
+	// Different owner should produce different genesis hash.
+	legacyGenesis := NewGenesisBlock()
+	if genesis.Hash == legacyGenesis.Hash {
+		t.Error("custom genesis should have different hash from legacy genesis")
+	}
+}
+
+func TestNewGenesisBlockWithOwner_Deterministic(t *testing.T) {
+	addr := "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
+	g1 := NewGenesisBlockWithOwner(addr)
+	g2 := NewGenesisBlockWithOwner(addr)
+
+	if g1.Hash != g2.Hash {
+		t.Error("NewGenesisBlockWithOwner() should be deterministic for same address")
+	}
+}
+
+func TestGenesisOwnerFromBlock(t *testing.T) {
+	customAddr := "1122334455667788112233445566778811223344556677881122334455667788"
+	genesis := NewGenesisBlockWithOwner(customAddr)
+
+	owner, ok := GenesisOwnerFromBlock(genesis)
+	if !ok {
+		t.Fatal("GenesisOwnerFromBlock() returned false")
+	}
+	if owner != customAddr {
+		t.Errorf("GenesisOwnerFromBlock() = %s, want %s", owner, customAddr)
+	}
+}
+
+func TestGenesisOwnerFromBlock_Legacy(t *testing.T) {
+	genesis := NewGenesisBlock()
+
+	owner, ok := GenesisOwnerFromBlock(genesis)
+	if !ok {
+		t.Fatal("GenesisOwnerFromBlock() returned false for legacy genesis")
+	}
+	if owner != LegacyGenesisAddress {
+		t.Errorf("GenesisOwnerFromBlock() = %s, want %s", owner, LegacyGenesisAddress)
+	}
+}
+
+func TestGenesisOwnerFromBlock_Nil(t *testing.T) {
+	_, ok := GenesisOwnerFromBlock(nil)
+	if ok {
+		t.Error("GenesisOwnerFromBlock(nil) should return false")
+	}
+}
+
+func TestGenesisOwnerFromBlock_NonGenesis(t *testing.T) {
+	b := &Block{
+		Header: BlockHeader{
+			Height: 1, // not genesis
+		},
+		Transactions: []Transaction{},
+	}
+	_, ok := GenesisOwnerFromBlock(b)
+	if ok {
+		t.Error("GenesisOwnerFromBlock() should return false for non-genesis block")
 	}
 }

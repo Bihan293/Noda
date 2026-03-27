@@ -164,7 +164,7 @@ func TestUTXOConsistency(t *testing.T) {
 	}
 
 	// Genesis address should have 11M.
-	genesisBalance := utxoSet.Balance(block.GenesisAddress)
+	genesisBalance := utxoSet.Balance(block.LegacyGenesisAddress)
 	if genesisBalance != block.GenesisSupply {
 		t.Errorf("genesis balance = %f, want %f", genesisBalance, block.GenesisSupply)
 	}
@@ -285,8 +285,8 @@ func TestLedgerPersistence(t *testing.T) {
 	}
 
 	// Balances should match.
-	b1 := l1.GetBalance(block.GenesisAddress)
-	b2 := l2.GetBalance(block.GenesisAddress)
+	b1 := l1.GetBalance(block.LegacyGenesisAddress)
+	b2 := l2.GetBalance(block.LegacyGenesisAddress)
 	if b1 != b2 {
 		t.Errorf("genesis balance: saved=%f loaded=%f", b1, b2)
 	}

@@ -332,23 +332,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
-		"port":          s.Port,
-		"version":       "0.5.0",
-		"block_height":  ch.Height(),
-		"chain_length":  ch.Len(),
-		"peers":         len(s.Network.GetPeers()),
-		"http_peers":    len(s.Network.GetPeers()),
-		"total_mined":   ch.TotalMined,
-		"block_reward":  s.Ledger.GetBlockReward(),
-		"total_faucet":  ch.TotalFaucet,
-		"faucet_active": s.Ledger.IsFaucetActive(),
-		"mempool_size":  s.Ledger.GetMempoolSize(),
-		"utxo_count":    s.Ledger.UTXOSet.Size(),
-		"p2p_peers":     s.Network.PeerCount(),
-		"max_supply":    block.MaxTotalSupply,
+		"port":                  s.Port,
+		"version":               "0.5.0",
+		"block_height":          ch.Height(),
+		"chain_length":          ch.Len(),
+		"peers":                 len(s.Network.GetPeers()),
+		"http_peers":            len(s.Network.GetPeers()),
+		"total_mined":           ch.TotalMined,
+		"block_reward":          s.Ledger.GetBlockReward(),
+		"total_faucet":          ch.TotalFaucet,
+		"faucet_active":         s.Ledger.IsFaucetActive(),
+		"mempool_size":          s.Ledger.GetMempoolSize(),
+		"utxo_count":            s.Ledger.UTXOSet.Size(),
+		"p2p_peers":             s.Network.PeerCount(),
+		"max_supply":            block.MaxTotalSupply,
+		"genesis_owner":         s.Ledger.GenesisOwner(),
+		"faucet_owner_match":    s.Ledger.FaucetOwnerMatch(),
+		"usable_faucet_balance": s.Ledger.UsableFaucetBalance(),
 	}
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
+		resp["faucet_owner"] = addr
 		resp["faucet_balance"] = s.Ledger.GetBalance(addr)
 		resp["faucet_remaining"] = s.Ledger.FaucetRemaining()
 	}

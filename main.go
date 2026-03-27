@@ -46,6 +46,7 @@ import (
 
 	"github.com/Bihan293/Noda/api"
 	"github.com/Bihan293/Noda/block"
+	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/ledger"
 	m "github.com/Bihan293/Noda/metrics"
 	"github.com/Bihan293/Noda/network"
@@ -148,7 +149,19 @@ func main() {
 	)
 
 	// Load or create ledger (chain + UTXO + mempool).
-	l := ledger.LoadLedger(*dataFile)
+	// If a faucet key is provided, derive the genesis owner address from it
+	// so that a new chain assigns the genesis supply to the correct owner.
+	var l *ledger.Ledger
+	if *faucetKey != "" {
+		genesisOwner, err := crypto.AddressFromPrivateKey(*faucetKey)
+		if err != nil {
+			slog.Error("Invalid FAUCET_KEY: cannot derive address", "error", err)
+			os.Exit(1)
+		}
+		l = ledger.LoadLedgerWithOwner(*dataFile, genesisOwner)
+	} else {
+		l = ledger.LoadLedger(*dataFile)
+	}
 
 	// Update metrics from initial state.
 	m.BlockHeight.Set(int64(l.GetChainHeight()))
@@ -172,15 +185,19 @@ func main() {
 
 	// Configure faucet wallet if key is provided.
 	if *faucetKey != "" {
-		if err := l.SetFaucetKey(*faucetKey); err != nil {
-			slog.Error("Faucet key error", "error", err)
+		if err := l.SetFaucetKeyAndValidateGenesis(*faucetKey); err != nil {
+			slog.Error("FATAL: faucet/genesis key validation failed", "error", err)
+			slog.Error("The provided FAUCET_KEY does not match the genesis owner recorded in the chain.")
+			slog.Error("Either use the correct key or delete the data file to start a new chain.")
 			os.Exit(1)
 		}
 		m.FaucetActive.Set(1)
 		m.FaucetRemaining.Set(l.FaucetRemaining())
 		slog.Info("Faucet configured",
-			"address", l.FaucetAddress(),
-			"balance", l.GetBalance(l.FaucetAddress()),
+			"faucet_address", l.FaucetAddress(),
+			"genesis_owner", l.GenesisOwner(),
+			"owner_match", l.FaucetOwnerMatch(),
+			"usable_balance", l.UsableFaucetBalance(),
 			"remaining", l.FaucetRemaining(),
 		)
 	} else {

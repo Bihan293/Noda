@@ -272,7 +272,7 @@ func TestRebuildFromBlocks(t *testing.T) {
 		t.Fatalf("RebuildFromBlocks() error: %v", err)
 	}
 
-	balance := s.Balance(block.GenesisAddress)
+	balance := s.Balance(block.LegacyGenesisAddress)
 	if balance != block.GenesisSupply {
 		t.Errorf("genesis balance = %f, want %f", balance, block.GenesisSupply)
 	}

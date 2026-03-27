@@ -49,8 +49,9 @@ const (
 	// MaxDifficultyAdjustmentFactor limits how much difficulty can change in one adjustment.
 	MaxDifficultyAdjustmentFactor = 4.0
 
-	// GenesisAddress is the well-known address that holds the genesis supply.
-	GenesisAddress = "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
+	// LegacyGenesisAddress is the historical hardcoded address used in pre-CRITICAL-1 chains.
+	// New chains derive the genesis owner from the configured FAUCET_KEY / GENESIS_PRIVATE_KEY.
+	LegacyGenesisAddress = "8fdc70be14ada0e514953b00e9148df9ba6207233d72b4c8e4f8cbd275c181de"
 
 	// BlockVersion is the current block format version.
 	BlockVersion uint32 = 1
@@ -352,11 +353,20 @@ func NewCoinbaseTx(minerAddress string, reward float64, height uint64) Transacti
 
 // NewGenesisBlock creates the genesis block with the initial supply transaction.
 // The genesis block has height 0, no previous hash, and a pre-set nonce/hash.
+// It uses the LegacyGenesisAddress for backward compatibility.
+// New code should use NewGenesisBlockWithOwner instead.
 func NewGenesisBlock() *Block {
-	// Genesis transaction: mint the entire faucet supply to the genesis address.
+	return NewGenesisBlockWithOwner(LegacyGenesisAddress)
+}
+
+// NewGenesisBlockWithOwner creates the genesis block assigning the initial supply
+// to the provided owner address. This address is the one that must be controlled
+// by the faucet key to spend genesis funds.
+func NewGenesisBlockWithOwner(ownerAddress string) *Block {
+	// Genesis transaction: mint the entire faucet supply to the owner address.
 	genesisTx := Transaction{
 		From:      "",
-		To:        GenesisAddress,
+		To:        ownerAddress,
 		Amount:    GenesisSupply,
 		Timestamp: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
 		Signature: "genesis",
@@ -386,6 +396,20 @@ func NewGenesisBlock() *Block {
 	block.Hash = HashBlockHeader(header)
 
 	return block
+}
+
+// GenesisOwnerFromBlock extracts the genesis supply recipient from a genesis block.
+// Returns the address and true if found, or empty string and false.
+func GenesisOwnerFromBlock(b *Block) (string, bool) {
+	if b == nil || b.Header.Height != 0 || len(b.Transactions) == 0 {
+		return "", false
+	}
+	for _, tx := range b.Transactions {
+		if tx.Signature == "genesis" && tx.From == "" && tx.Amount == GenesisSupply {
+			return tx.To, true
+		}
+	}
+	return "", false
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -9,6 +9,12 @@
 //
 // The ledger uses UTXO for balance computation instead of a flat account map.
 // Per-address faucet cooldown is removed; the only limit is the global 11M cap.
+//
+// Genesis ownership:
+//
+//	The genesis supply (11M) is assigned to an address derived from the configured
+//	faucet/genesis private key. The genesis owner is stored in chain metadata and
+//	verified on every restart. A mismatched key causes a fail-fast error.
 package ledger
 
 import (
@@ -43,6 +49,14 @@ const (
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Errors
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ErrGenesisOwnerMismatch is returned when the provided faucet key does not
+// match the genesis owner recorded in the chain.
+var ErrGenesisOwnerMismatch = fmt.Errorf("genesis owner mismatch")
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Ledger
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -64,9 +78,16 @@ type Ledger struct {
 	faucetAddress string // derived from faucetPrivKey
 }
 
-// NewLedger creates a new ledger with a genesis blockchain, UTXO set, and mempool.
+// NewLedger creates a new ledger with a genesis blockchain using the legacy
+// hardcoded genesis address. For new networks, use NewLedgerWithOwner.
 func NewLedger(filePath string) *Ledger {
-	bc := chain.NewBlockchain()
+	return NewLedgerWithOwner(filePath, block.LegacyGenesisAddress)
+}
+
+// NewLedgerWithOwner creates a new ledger with a genesis blockchain where the
+// genesis supply (11M) belongs to the specified owner address.
+func NewLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
+	bc := chain.NewBlockchainWithOwner(genesisOwner)
 
 	// Build UTXO set from genesis block.
 	utxoSet, err := utxo.RebuildFromBlocks(bc.Blocks)
@@ -88,17 +109,148 @@ func NewLedger(filePath string) *Ledger {
 
 	slog.Info("New ledger created",
 		"genesis_supply", block.GenesisSupply,
-		"genesis_address", block.GenesisAddress,
+		"genesis_owner", genesisOwner,
 		"utxo_count", utxoSet.Size(),
 	)
 	return l
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Faucet Configuration
+// Genesis Owner Management
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GenesisOwner returns the address that owns the genesis supply, as recorded
+// in the chain metadata or extracted from the genesis block.
+func (l *Ledger) GenesisOwner() string {
+	// Prefer the explicit metadata field.
+	if l.Chain.GenesisOwner != "" {
+		return l.Chain.GenesisOwner
+	}
+	// Fall back to inspecting the genesis block itself.
+	if len(l.Chain.Blocks) > 0 {
+		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
+			return owner
+		}
+	}
+	return ""
+}
+
+// FaucetOwnerMatch returns true if the configured faucet address matches the
+// genesis owner (i.e. the faucet actually controls the genesis funds).
+func (l *Ledger) FaucetOwnerMatch() bool {
+	if l.faucetAddress == "" {
+		return false
+	}
+	return l.faucetAddress == l.GenesisOwner()
+}
+
+// UsableFaucetBalance returns the actual spendable balance on the genesis/faucet
+// address from the UTXO set. If faucet address != genesis owner, returns 0.
+func (l *Ledger) UsableFaucetBalance() float64 {
+	if !l.FaucetOwnerMatch() {
+		return 0
+	}
+	return l.UTXOSet.Balance(l.faucetAddress)
+}
+
+// SetFaucetKeyAndValidateGenesis configures the faucet wallet and ensures the
+// key matches the genesis owner recorded in the chain.
+//
+// On a NEW chain (height 0, no faucet distributed):
+//   - If the chain still uses the legacy hardcoded genesis address, perform a
+//     one-time migration to rebind genesis to the provided key.
+//
+// On an EXISTING chain:
+//   - If the key does not match the recorded genesis owner, return a fail-fast
+//     error with a clear message.
+func (l *Ledger) SetFaucetKeyAndValidateGenesis(privKeyHex string) error {
+	addr, err := crypto.AddressFromPrivateKey(privKeyHex)
+	if err != nil {
+		return fmt.Errorf("invalid faucet private key: %w", err)
+	}
+
+	currentGenesisOwner := l.GenesisOwner()
+
+	// ── Case 1: Key matches the existing genesis owner — happy path ──
+	if addr == currentGenesisOwner {
+		l.faucetPrivKey = privKeyHex
+		l.faucetAddress = addr
+		slog.Info("Faucet wallet configured (matches genesis owner)", "address", addr)
+		return nil
+	}
+
+	// ── Case 2: Fresh chain or legacy chain at height 0 — safe migration ──
+	if l.canMigrateLegacyGenesis() {
+		slog.Info("Migrating genesis owner from legacy address to configured key",
+			"old_owner", currentGenesisOwner,
+			"new_owner", addr,
+		)
+		if err := l.migrateLegacyGenesis(addr); err != nil {
+			return fmt.Errorf("legacy genesis migration failed: %w", err)
+		}
+		l.faucetPrivKey = privKeyHex
+		l.faucetAddress = addr
+		slog.Info("Faucet wallet configured after genesis migration", "address", addr)
+		return nil
+	}
+
+	// ── Case 3: Existing chain with incompatible key — fail fast ──
+	return fmt.Errorf("%w: the chain records genesis owner as %s, "+
+		"but the provided faucet key derives address %s. "+
+		"Either use the correct FAUCET_KEY for this chain, or start a new chain",
+		ErrGenesisOwnerMismatch, shortAddr(currentGenesisOwner), shortAddr(addr))
+}
+
+// canMigrateLegacyGenesis returns true if the chain is eligible for a one-time
+// migration of the genesis owner. Conditions:
+//   - Chain height is 0 (only genesis block)
+//   - No faucet coins have been distributed yet
+//   - Current genesis owner is the legacy hardcoded address
+func (l *Ledger) canMigrateLegacyGenesis() bool {
+	if l.Chain.Height() > 0 {
+		return false
+	}
+	if l.Chain.TotalFaucet > 0 {
+		return false
+	}
+	currentOwner := l.GenesisOwner()
+	return currentOwner == block.LegacyGenesisAddress
+}
+
+// migrateLegacyGenesis replaces the legacy genesis block with one that assigns
+// the supply to the new owner address, and rebuilds the UTXO set.
+func (l *Ledger) migrateLegacyGenesis(newOwnerAddress string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Replace the chain with a fresh one rooted at the new owner.
+	bc := chain.NewBlockchainWithOwner(newOwnerAddress)
+
+	// Rebuild UTXO set.
+	utxoSet, err := utxo.RebuildFromBlocks(bc.Blocks)
+	if err != nil {
+		return fmt.Errorf("UTXO rebuild after genesis migration failed: %w", err)
+	}
+
+	l.Chain = bc
+	l.UTXOSet = utxoSet
+	l.Balances = utxoSet.AllBalances()
+
+	// Persist immediately.
+	if err := l.saveLocked(); err != nil {
+		slog.Warn("Failed to persist after genesis migration", "error", err)
+	}
+
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Faucet Configuration (legacy entry point)
 // ──────────────────────────────────────────────────────────────────────────────
 
 // SetFaucetKey configures the faucet wallet from a hex-encoded private key.
+// This is a simplified version that does NOT validate genesis ownership.
+// Prefer SetFaucetKeyAndValidateGenesis for production startup.
 func (l *Ledger) SetFaucetKey(privKeyHex string) error {
 	addr, err := crypto.AddressFromPrivateKey(privKeyHex)
 	if err != nil {
@@ -123,10 +275,13 @@ func (l *Ledger) FaucetTotalDistributed() float64 {
 }
 
 // IsFaucetActive returns true if the faucet can still distribute coins.
+// Now also requires that the faucet address matches the genesis owner.
 func (l *Ledger) IsFaucetActive() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return l.faucetPrivKey != "" && l.Chain.TotalFaucet < FaucetGlobalCap
+	return l.faucetPrivKey != "" &&
+		l.faucetAddress == l.Chain.GenesisOwner &&
+		l.Chain.TotalFaucet < FaucetGlobalCap
 }
 
 // FaucetRemaining returns how many coins the faucet can still distribute.
@@ -339,6 +494,12 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		return nil, fmt.Errorf("faucet not configured: start node with -faucet-key flag")
 	}
 
+	// Verify faucet address controls genesis funds.
+	if !l.FaucetOwnerMatch() {
+		return nil, fmt.Errorf("faucet address %s does not match genesis owner %s — faucet cannot spend genesis funds",
+			shortAddr(l.faucetAddress), shortAddr(l.GenesisOwner()))
+	}
+
 	if toAddress == "" {
 		return nil, fmt.Errorf("invalid address: 'to' address is required")
 	}
@@ -490,6 +651,14 @@ func LoadLedger(filePath string) *Ledger {
 		}
 	}
 
+	// Back-fill GenesisOwner from genesis block if metadata is missing (legacy data).
+	if l.Chain != nil && l.Chain.GenesisOwner == "" && len(l.Chain.Blocks) > 0 {
+		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
+			l.Chain.GenesisOwner = owner
+			slog.Info("Back-filled genesis owner from genesis block", "genesis_owner", owner)
+		}
+	}
+
 	// Rebuild UTXO set from the loaded chain.
 	if l.Chain != nil {
 		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
@@ -512,6 +681,72 @@ func LoadLedger(filePath string) *Ledger {
 		"blocks", l.Chain.Len(),
 		"path", filePath,
 		"utxo_count", l.UTXOSet.Size(),
+		"genesis_owner", l.GenesisOwner(),
+	)
+	return &l
+}
+
+// LoadLedgerWithOwner reads a ledger from a JSON file with a specific genesis owner.
+// If no file exists, creates a new chain with the given owner.
+func LoadLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		slog.Info("No data file found, starting fresh with configured genesis owner",
+			"path", filePath,
+			"genesis_owner", genesisOwner,
+		)
+		return NewLedgerWithOwner(filePath, genesisOwner)
+	}
+
+	// File exists — load normally (genesis owner validated later via SetFaucetKeyAndValidateGenesis).
+	var l Ledger
+	if err := json.Unmarshal(data, &l); err != nil {
+		slog.Warn("Failed to parse data file, starting fresh", "path", filePath, "error", err)
+		return NewLedgerWithOwner(filePath, genesisOwner)
+	}
+	l.filePath = filePath
+	if l.Balances == nil {
+		l.Balances = make(map[string]float64)
+	}
+
+	// Rebuild chain target from hex if needed.
+	if l.Chain != nil && l.Chain.Target == nil {
+		if l.Chain.TargetHex != "" {
+			l.Chain.Target = block.TargetFromBits(l.Chain.TargetHex)
+		} else {
+			l.Chain.Target = block.InitialTarget
+		}
+	}
+
+	// Back-fill GenesisOwner from genesis block if metadata is missing (legacy data).
+	if l.Chain != nil && l.Chain.GenesisOwner == "" && len(l.Chain.Blocks) > 0 {
+		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
+			l.Chain.GenesisOwner = owner
+			slog.Info("Back-filled genesis owner from genesis block", "genesis_owner", owner)
+		}
+	}
+
+	// Rebuild UTXO set from the loaded chain.
+	if l.Chain != nil {
+		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
+		if err != nil {
+			slog.Warn("UTXO rebuild failed, using balance map fallback", "error", err)
+			utxoSet = utxo.NewSet()
+		} else {
+			l.Balances = utxoSet.AllBalances()
+		}
+		l.UTXOSet = utxoSet
+	} else {
+		l.UTXOSet = utxo.NewSet()
+	}
+
+	l.Mempool = mempool.New(mempool.DefaultMaxSize)
+
+	slog.Info("Ledger loaded",
+		"blocks", l.Chain.Len(),
+		"path", filePath,
+		"utxo_count", l.UTXOSet.Size(),
+		"genesis_owner", l.GenesisOwner(),
 	)
 	return &l
 }

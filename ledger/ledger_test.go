@@ -37,7 +37,7 @@ func TestNewLedger(t *testing.T) {
 
 func TestGetBalance_Genesis(t *testing.T) {
 	l := NewLedger(tmpFile(t))
-	balance := l.GetBalance(block.GenesisAddress)
+	balance := l.GetBalance(block.LegacyGenesisAddress)
 	if balance != block.GenesisSupply {
 		t.Errorf("genesis balance = %f, want %f", balance, block.GenesisSupply)
 	}
@@ -54,8 +54,8 @@ func TestGetBalance_Unknown(t *testing.T) {
 func TestGetAllBalances(t *testing.T) {
 	l := NewLedger(tmpFile(t))
 	balances := l.GetAllBalances()
-	if balances[block.GenesisAddress] != block.GenesisSupply {
-		t.Errorf("genesis balance = %f, want %f", balances[block.GenesisAddress], block.GenesisSupply)
+	if balances[block.LegacyGenesisAddress] != block.GenesisSupply {
+		t.Errorf("genesis balance = %f, want %f", balances[block.LegacyGenesisAddress], block.GenesisSupply)
 	}
 }
 
@@ -306,4 +306,283 @@ func TestGetPendingTransactions(t *testing.T) {
 	if len(pending) != 0 {
 		t.Errorf("GetPendingTransactions() len = %d, want 0", len(pending))
 	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// [CRITICAL-1] Genesis/Faucet Ownership Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Test that a new random key gets control over genesis/faucet funds.
+func TestNewKeyGetsGenesisControl(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	// Create a fresh ledger with the key's address as genesis owner.
+	l := NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// Genesis owner should be the new key's address.
+	if l.GenesisOwner() != kp.Address {
+		t.Errorf("GenesisOwner() = %s, want %s", l.GenesisOwner(), kp.Address)
+	}
+
+	// Balance should be on the new key's address.
+	balance := l.GetBalance(kp.Address)
+	if balance != block.GenesisSupply {
+		t.Errorf("genesis balance = %f, want %f", balance, block.GenesisSupply)
+	}
+
+	// SetFaucetKeyAndValidateGenesis should succeed for matching key.
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatalf("SetFaucetKeyAndValidateGenesis() error: %v", err)
+	}
+
+	// Faucet should match genesis owner.
+	if !l.FaucetOwnerMatch() {
+		t.Error("FaucetOwnerMatch() should be true")
+	}
+
+	// Usable faucet balance should be the genesis supply.
+	usable := l.UsableFaucetBalance()
+	if usable != block.GenesisSupply {
+		t.Errorf("UsableFaucetBalance() = %f, want %f", usable, block.GenesisSupply)
+	}
+
+	// Faucet should be active.
+	if !l.IsFaucetActive() {
+		t.Error("IsFaucetActive() should be true")
+	}
+}
+
+// Test that a faucet can actually distribute coins when key matches genesis.
+func TestFaucetWorksWithMatchingKey(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	recipient, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := NewLedgerWithOwner(tmpFile(t), kp.Address)
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatalf("SetFaucetKeyAndValidateGenesis() error: %v", err)
+	}
+
+	// ProcessFaucet should succeed.
+	tx, err := l.ProcessFaucet(recipient.Address)
+	if err != nil {
+		t.Fatalf("ProcessFaucet() error: %v", err)
+	}
+	if tx == nil {
+		t.Fatal("ProcessFaucet() returned nil tx")
+	}
+	if tx.Amount != FaucetAmount {
+		t.Errorf("faucet tx amount = %f, want %f", tx.Amount, FaucetAmount)
+	}
+
+	// Recipient should have received coins.
+	recipientBalance := l.GetBalance(recipient.Address)
+	if recipientBalance != FaucetAmount {
+		t.Errorf("recipient balance = %f, want %f", recipientBalance, FaucetAmount)
+	}
+}
+
+// Test that an incompatible key on an existing chain causes a clear error.
+func TestIncompatibleKeyFailsFast(t *testing.T) {
+	kp1, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp2, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv1Hex := hex.EncodeToString(kp1.PrivateKey)
+	priv2Hex := hex.EncodeToString(kp2.PrivateKey)
+
+	path := tmpFile(t)
+
+	// Create chain with kp1 as genesis owner.
+	l := NewLedgerWithOwner(path, kp1.Address)
+	if err := l.SetFaucetKeyAndValidateGenesis(priv1Hex); err != nil {
+		t.Fatalf("first SetFaucetKeyAndValidateGenesis() error: %v", err)
+	}
+
+	// Do a faucet transaction to move chain beyond genesis-only state.
+	recipient, _ := crypto.GenerateKeyPair()
+	_, err = l.ProcessFaucet(recipient.Address)
+	if err != nil {
+		t.Fatalf("ProcessFaucet() error: %v", err)
+	}
+
+	// Save and reload.
+	if err := l.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	l2 := LoadLedger(path)
+
+	// Try using kp2 (different key) — should fail fast.
+	err = l2.SetFaucetKeyAndValidateGenesis(priv2Hex)
+	if err == nil {
+		t.Fatal("SetFaucetKeyAndValidateGenesis() should fail for incompatible key")
+	}
+	if !isGenesisOwnerMismatch(err) {
+		t.Errorf("expected genesis owner mismatch error, got: %v", err)
+	}
+}
+
+// Test that legacy height=0 chain migrates safely.
+func TestLegacyGenesisMigration(t *testing.T) {
+	path := tmpFile(t)
+
+	// Create a legacy-style ledger (uses hardcoded LegacyGenesisAddress).
+	l := NewLedger(path)
+
+	// Verify it uses the legacy address.
+	if l.GenesisOwner() != block.LegacyGenesisAddress {
+		t.Fatalf("expected legacy genesis owner %s, got %s",
+			block.LegacyGenesisAddress, l.GenesisOwner())
+	}
+
+	// Balance should be on legacy address.
+	legacyBalance := l.GetBalance(block.LegacyGenesisAddress)
+	if legacyBalance != block.GenesisSupply {
+		t.Fatalf("legacy genesis balance = %f, want %f", legacyBalance, block.GenesisSupply)
+	}
+
+	// Generate a new key and attempt migration.
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	// Migration should succeed since height=0 and no faucet distributed.
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatalf("SetFaucetKeyAndValidateGenesis() for legacy migration error: %v", err)
+	}
+
+	// Genesis owner should now be the new key.
+	if l.GenesisOwner() != kp.Address {
+		t.Errorf("after migration GenesisOwner() = %s, want %s", l.GenesisOwner(), kp.Address)
+	}
+
+	// Balance should have moved to the new address.
+	newBalance := l.GetBalance(kp.Address)
+	if newBalance != block.GenesisSupply {
+		t.Errorf("after migration balance = %f, want %f", newBalance, block.GenesisSupply)
+	}
+
+	// Legacy address should have zero balance.
+	legacyBalance = l.GetBalance(block.LegacyGenesisAddress)
+	if legacyBalance != 0 {
+		t.Errorf("legacy address still has balance %f after migration", legacyBalance)
+	}
+}
+
+// Test that legacy chain beyond height=0 does NOT allow migration.
+func TestLegacyMigration_BlockedAfterActivity(t *testing.T) {
+	path := tmpFile(t)
+
+	// Create a legacy ledger — faucet uses a key that does NOT match legacy address.
+	l := NewLedger(path)
+
+	// Simulate some faucet activity by incrementing TotalFaucet.
+	l.Chain.TotalFaucet = 5000
+
+	// Generate a new key.
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	// Migration should be blocked because TotalFaucet > 0.
+	err = l.SetFaucetKeyAndValidateGenesis(privHex)
+	if err == nil {
+		t.Fatal("SetFaucetKeyAndValidateGenesis() should fail — migration blocked after faucet activity")
+	}
+}
+
+// Test GenesisOwner is persisted and restored correctly.
+func TestGenesisOwnerPersistence(t *testing.T) {
+	path := tmpFile(t)
+
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create ledger with specific genesis owner.
+	l := NewLedgerWithOwner(path, kp.Address)
+	if err := l.Save(); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	// Reload and verify.
+	l2 := LoadLedger(path)
+	if l2.GenesisOwner() != kp.Address {
+		t.Errorf("loaded GenesisOwner() = %s, want %s", l2.GenesisOwner(), kp.Address)
+	}
+}
+
+// Test that /status endpoint returns genesis_owner info.
+func TestStatusShowsGenesisOwner(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	owner := l.GenesisOwner()
+	if owner != kp.Address {
+		t.Errorf("GenesisOwner() = %s, want %s", owner, kp.Address)
+	}
+
+	// Without faucet configured, FaucetOwnerMatch should be false.
+	if l.FaucetOwnerMatch() {
+		t.Error("FaucetOwnerMatch() should be false without faucet configured")
+	}
+
+	// UsableFaucetBalance should be 0 when no match.
+	if l.UsableFaucetBalance() != 0 {
+		t.Errorf("UsableFaucetBalance() = %f, want 0", l.UsableFaucetBalance())
+	}
+}
+
+// Test LoadLedgerWithOwner creates a new chain with the correct owner.
+func TestLoadLedgerWithOwner_NewFile(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := tmpFile(t)
+	l := LoadLedgerWithOwner(path, kp.Address)
+
+	if l.GenesisOwner() != kp.Address {
+		t.Errorf("GenesisOwner() = %s, want %s", l.GenesisOwner(), kp.Address)
+	}
+	if l.GetBalance(kp.Address) != block.GenesisSupply {
+		t.Errorf("balance = %f, want %f", l.GetBalance(kp.Address), block.GenesisSupply)
+	}
+}
+
+// isGenesisOwnerMismatch checks if the error is a genesis owner mismatch.
+func isGenesisOwnerMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check using errors.Is-like behavior.
+	return err.Error() != "" && (err == ErrGenesisOwnerMismatch ||
+		len(err.Error()) > len("genesis owner mismatch") &&
+			err.Error()[:len("genesis owner mismatch")] == "genesis owner mismatch")
 }
