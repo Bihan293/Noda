@@ -1,10 +1,7 @@
 // Package api provides the HTTP server with JSON endpoints for interacting
 // with the cryptocurrency node. All endpoints return JSON responses.
 //
-// New in this version:
-//   - POST /sign   — sign a transaction without broadcasting
-//   - POST /send   — sign + validate + add to chain + broadcast in one call
-//   - POST /faucet — request free test coins from the faucet wallet
+// Updated for block-based chain with PoW, halving, and new faucet logic.
 package api
 
 import (
@@ -14,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Bihan293/Noda/chain"
+	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/ledger"
 	"github.com/Bihan293/Noda/network"
@@ -61,7 +58,6 @@ type TransactionRequest struct {
 }
 
 // SendRequest is the JSON body for POST /sign and POST /send.
-// The private key is used to sign; "from" is derived if omitted.
 type SendRequest struct {
 	From       string  `json:"from"`
 	To         string  `json:"to"`
@@ -81,7 +77,7 @@ type KeyPairResponse struct {
 	PrivateKey string `json:"private_key"`
 }
 
-// ---------- Existing Handlers (upgraded with logging) ----------
+// ---------- Handlers ----------
 
 // handleBalance returns the balance for a given address.
 // GET /balance?address=<hex_pubkey>
@@ -103,7 +99,7 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTransaction processes a pre-signed transaction.
-// POST /transaction  — body: {from, to, amount, signature}
+// POST /transaction — body: {from, to, amount, signature}
 func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -119,14 +115,14 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[TX] Received: %s -> %s (%.2f coins)", shortAddr(req.From), shortAddr(req.To), req.Amount)
 
-	tx := chain.Transaction{
+	tx := block.Transaction{
 		From:      req.From,
 		To:        req.To,
 		Amount:    req.Amount,
 		Signature: req.Signature,
 	}
 
-	if err := s.Ledger.ProcessTransaction(tx); err != nil {
+	if err := s.Ledger.ValidateAndProcessUserTx(tx); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -165,7 +161,7 @@ func (s *Server) handleGenerateKeys(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[KEYS] Generated new key pair — address: %s", shortAddr(kp.Address))
 	jsonResponse(w, http.StatusOK, KeyPairResponse{
 		Address:    kp.Address,
-		PublicKey:  kp.Address, // same as address for Ed25519
+		PublicKey:  kp.Address,
 		PrivateKey: fmt.Sprintf("%x", kp.PrivateKey),
 	})
 }
@@ -183,7 +179,7 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAddPeer registers a new peer.
-// POST /peers  — body: {"peer": "http://host:port"}
+// POST /peers — body: {"peer": "http://host:port"}
 func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -216,33 +212,34 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStatus returns basic node info.
+// handleStatus returns node status including block height, mining info, and faucet state.
 // GET /status
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		errorResponse(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
-		"port":         s.Port,
-		"chain_length": s.Ledger.GetChain().Len(),
-		"peers":        len(s.Network.GetPeers()),
+		"port":          s.Port,
+		"block_height":  ch.Height(),
+		"chain_length":  ch.Len(),
+		"peers":         len(s.Network.GetPeers()),
+		"total_mined":   ch.TotalMined,
+		"block_reward":  s.Ledger.GetBlockReward(),
+		"total_faucet":  ch.TotalFaucet,
+		"faucet_active": s.Ledger.IsFaucetActive(),
 	}
-	// Include faucet address if configured.
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
 		resp["faucet_balance"] = s.Ledger.GetBalance(addr)
+		resp["faucet_remaining"] = s.Ledger.FaucetRemaining()
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }
 
-// ---------- NEW Handlers ----------
-
 // handleSign signs a transaction and returns it without broadcasting.
-// POST /sign  — body: {from, to, amount, private_key}
-//
-// If "from" is omitted, it is derived from the private key.
-// The response includes the full transaction object and the signature.
+// POST /sign — body: {from, to, amount, private_key}
 func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -255,7 +252,6 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields.
 	if req.PrivateKey == "" {
 		errorResponse(w, http.StatusBadRequest, "private_key is required")
 		return
@@ -269,7 +265,6 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Derive "from" from private key if not provided.
 	from := req.From
 	if from == "" {
 		derived, err := crypto.AddressFromPrivateKey(req.PrivateKey)
@@ -280,14 +275,13 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		from = derived
 	}
 
-	// Sign the transaction.
 	sig, err := crypto.SignTransaction(req.PrivateKey, from, req.To, req.Amount)
 	if err != nil {
 		errorResponse(w, http.StatusBadRequest, "signing failed: "+err.Error())
 		return
 	}
 
-	tx := chain.Transaction{
+	tx := block.Transaction{
 		From:      from,
 		To:        req.To,
 		Amount:    req.Amount,
@@ -303,9 +297,7 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSend is the all-in-one endpoint: sign + validate + chain + broadcast.
-// POST /send  — body: {from, to, amount, private_key}
-//
-// If "from" is omitted, it is derived from the private key.
+// POST /send — body: {from, to, amount, private_key}
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -318,7 +310,6 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields.
 	if req.PrivateKey == "" {
 		errorResponse(w, http.StatusBadRequest, "private_key is required")
 		return
@@ -332,7 +323,6 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Derive "from" from private key if not provided.
 	from := req.From
 	if from == "" {
 		derived, err := crypto.AddressFromPrivateKey(req.PrivateKey)
@@ -343,14 +333,13 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		from = derived
 	}
 
-	// Sign the transaction.
 	sig, err := crypto.SignTransaction(req.PrivateKey, from, req.To, req.Amount)
 	if err != nil {
 		errorResponse(w, http.StatusBadRequest, "signing failed: "+err.Error())
 		return
 	}
 
-	tx := chain.Transaction{
+	tx := block.Transaction{
 		From:      from,
 		To:        req.To,
 		Amount:    req.Amount,
@@ -359,8 +348,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[SEND] Processing: %s -> %s (%.2f coins)", shortAddr(from), shortAddr(req.To), req.Amount)
 
-	// Validate and add to chain.
-	if err := s.Ledger.ProcessTransaction(tx); err != nil {
+	if err := s.Ledger.ValidateAndProcessUserTx(tx); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -379,8 +367,8 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleFaucet sends free test coins to a given address.
-// POST /faucet  — body: {"to": "..."}
+// handleFaucet sends free coins to a given address.
+// POST /faucet — body: {"to": "..."}
 func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -410,10 +398,11 @@ func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	go s.Network.BroadcastTransaction(*tx)
 
 	jsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":     fmt.Sprintf("%.0f coins sent from faucet", ledger.FaucetAmount),
-		"to":          req.To,
-		"amount":      ledger.FaucetAmount,
-		"new_balance": s.Ledger.GetBalance(req.To),
+		"message":          fmt.Sprintf("%.0f coins sent from faucet", tx.Amount),
+		"to":               req.To,
+		"amount":           tx.Amount,
+		"new_balance":      s.Ledger.GetBalance(req.To),
+		"faucet_remaining": s.Ledger.FaucetRemaining(),
 	})
 }
 
@@ -428,7 +417,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/transaction", s.handleTransaction)
 	mux.HandleFunc("/chain", s.handleChain)
 
-	// New convenience endpoints
+	// Convenience endpoints
 	mux.HandleFunc("/sign", s.handleSign)
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/faucet", s.handleFaucet)
@@ -454,7 +443,6 @@ func (s *Server) Start() error {
 	log.Printf("=== Noda Node listening on http://0.0.0.0%s ===", addr)
 	log.Printf("Endpoints: /balance /transaction /chain /sign /send /faucet /generate-keys /status /peers /sync")
 
-	// Wrap the mux with request logging middleware.
 	return http.ListenAndServe(addr, loggingMiddleware(mux))
 }
 
