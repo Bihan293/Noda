@@ -1,21 +1,35 @@
 // Noda — a minimal cryptocurrency node in Go.
 //
+// Configuration is read from environment variables first, then CLI flags.
+// Environment variables take precedence over defaults but CLI flags override everything.
+//
+// Environment variables:
+//
+//	PORT       — HTTP port to listen on              (default: 3000)
+//	DATA_FILE  — path to the JSON storage file       (default: node_data.json)
+//	FAUCET_KEY — hex-encoded Ed25519 private key     (optional)
+//	PEERS      — comma-separated list of peer URLs   (optional)
+//
+// CLI flags (override env vars):
+//
+//	-port        HTTP port to listen on
+//	-peers       Comma-separated list of peer URLs
+//	-data        Path to the JSON storage file
+//	-faucet-key  Hex-encoded Ed25519 private key for the faucet wallet
+//
 // Usage:
 //
-//	go run main.go -port 3000 -peers "http://localhost:3001,http://localhost:3002"
-//	go run main.go -port 3001 -data node1.json -faucet-key "hex_private_key"
+//	# Using environment variables (Docker, Render, etc.)
+//	PORT=8080 PEERS="http://node1:3000" ./noda
 //
-// Flags:
-//
-//	-port        HTTP port to listen on  (default: 3000)
-//	-peers       Comma-separated list of peer URLs
-//	-data        Path to the JSON storage file  (default: node_data.json)
-//	-faucet-key  Hex-encoded Ed25519 private key for the faucet wallet
+//	# Using CLI flags (local development)
+//	./noda -port 3001 -peers "http://localhost:3000" -data node1.json
 package main
 
 import (
 	"flag"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/Bihan293/Noda/api"
@@ -23,12 +37,27 @@ import (
 	"github.com/Bihan293/Noda/network"
 )
 
+// envOrDefault returns the value of the environment variable named by key,
+// or fallback if the variable is not set or empty.
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func main() {
-	// ---- CLI Flags ----
-	port := flag.String("port", "3000", "HTTP port for this node")
-	peersFlag := flag.String("peers", "", "Comma-separated peer URLs (e.g. http://localhost:3001)")
-	dataFile := flag.String("data", "node_data.json", "Path to JSON storage file")
-	faucetKey := flag.String("faucet-key", "", "Hex-encoded Ed25519 private key for the faucet wallet")
+	// ---- Defaults from environment variables ----
+	defaultPort := envOrDefault("PORT", "3000")
+	defaultData := envOrDefault("DATA_FILE", "node_data.json")
+	defaultFaucet := envOrDefault("FAUCET_KEY", "")
+	defaultPeers := envOrDefault("PEERS", "")
+
+	// ---- CLI Flags (override env vars) ----
+	port := flag.String("port", defaultPort, "HTTP port for this node (env: PORT)")
+	peersFlag := flag.String("peers", defaultPeers, "Comma-separated peer URLs (env: PEERS)")
+	dataFile := flag.String("data", defaultData, "Path to JSON storage file (env: DATA_FILE)")
+	faucetKey := flag.String("faucet-key", defaultFaucet, "Hex-encoded Ed25519 private key for the faucet wallet (env: FAUCET_KEY)")
 	flag.Parse()
 
 	// ---- Parse peers ----
@@ -61,7 +90,7 @@ func main() {
 		}
 		log.Printf("  Faucet:  %s (balance: %.2f)", l.FaucetAddress(), l.GetBalance(l.FaucetAddress()))
 	} else {
-		log.Println("  Faucet:  disabled (use -faucet-key to enable)")
+		log.Println("  Faucet:  disabled (set FAUCET_KEY or use -faucet-key to enable)")
 	}
 
 	// Create the network layer with initial peers.

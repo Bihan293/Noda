@@ -13,44 +13,181 @@ A lightweight crypto node that supports transactions, Ed25519 signing, peer-to-p
 - **JSON persistence** — chain and balances saved to disk after every transaction
 - **Faucet** — configurable test-coin dispenser with per-address cooldown
 - **Structured logging** — every transaction, rejection, and sync event is logged
+- **Docker-ready** — multi-stage build, minimal image, deploy anywhere
+- **Environment variables** — configure via env vars for cloud/container deployment
 
-## Quick Start
+---
+
+## Configuration
+
+Noda reads configuration from **environment variables** first, then **CLI flags**.
+CLI flags override environment variables. Both fall back to sensible defaults.
+
+| Env Variable | CLI Flag       | Default          | Description                                      |
+|--------------|----------------|------------------|--------------------------------------------------|
+| `PORT`       | `-port`        | `3000`           | HTTP port for the node                           |
+| `DATA_FILE`  | `-data`        | `node_data.json` | Path to the JSON persistence file                |
+| `FAUCET_KEY` | `-faucet-key`  | (none)           | Hex-encoded Ed25519 private key for faucet wallet|
+| `PEERS`      | `-peers`       | (none)           | Comma-separated peer URLs                        |
+
+---
+
+## How to Run Locally
+
+### Prerequisites
+
+- [Go 1.22+](https://go.dev/dl/)
+
+### Build and run
 
 ```bash
-# Build
+# Build the binary
 go build -o noda .
 
-# Run node on port 3000 (default)
+# Run with defaults (port 3000, data in node_data.json)
 ./noda
 
-# Run with faucet enabled (generate a key first, then fund it)
-./noda -port 3000 -faucet-key "<hex_private_key>"
+# Run with environment variables
+PORT=8080 DATA_FILE=mydata.json ./noda
 
-# Run with custom port, peers, and data file
+# Run with CLI flags
 ./noda -port 3001 -peers "http://localhost:3000" -data node1.json
+
+# Run with faucet enabled
+FAUCET_KEY="your_hex_private_key" ./noda
+
+# Or mix both
+PORT=3001 ./noda -peers "http://localhost:3000"
 ```
 
-### Run Multiple Nodes
+### Run multiple nodes locally
 
 ```bash
 # Terminal 1 — main node with faucet
-./noda -port 3000 -data node0.json -faucet-key "<hex_private_key>"
+FAUCET_KEY="<hex_private_key>" ./noda
 
 # Terminal 2 — connects to node 1
-./noda -port 3001 -peers "http://localhost:3000" -data node1.json
+PORT=3001 PEERS="http://localhost:3000" DATA_FILE=node1.json ./noda
 
 # Terminal 3 — connects to both
-./noda -port 3002 -peers "http://localhost:3000,http://localhost:3001" -data node2.json
+PORT=3002 PEERS="http://localhost:3000,http://localhost:3001" DATA_FILE=node2.json ./noda
 ```
 
-## CLI Flags
+---
 
-| Flag           | Default          | Description                                      |
-|----------------|------------------|--------------------------------------------------|
-| `-port`        | `3000`           | HTTP port for the node                           |
-| `-peers`       | (none)           | Comma-separated peer URLs                        |
-| `-data`        | `node_data.json` | Path to the JSON persistence file                |
-| `-faucet-key`  | (none)           | Hex-encoded Ed25519 private key for faucet wallet|
+## How to Run with Docker
+
+### Build the image
+
+```bash
+docker build -t noda .
+```
+
+### Run a single node
+
+```bash
+# Basic run (port 3000)
+docker run -p 3000:3000 noda
+
+# Custom port
+docker run -e PORT=8080 -p 8080:8080 noda
+
+# With persistent data (survives container restart)
+docker run -p 3000:3000 -v noda-data:/app noda
+
+# With faucet enabled
+docker run -p 3000:3000 \
+  -e FAUCET_KEY="your_hex_private_key" \
+  noda
+
+# With peers
+docker run -p 3000:3000 \
+  -e PEERS="http://host.docker.internal:3001,http://host.docker.internal:3002" \
+  noda
+
+# Full example — all options
+docker run -d --name noda-node \
+  -p 3000:3000 \
+  -e PORT=3000 \
+  -e DATA_FILE=/app/node_data.json \
+  -e FAUCET_KEY="your_hex_private_key" \
+  -e PEERS="http://peer1:3000,http://peer2:3000" \
+  -v noda-data:/app \
+  noda
+```
+
+### Run a multi-node network with Docker
+
+```bash
+# Create a network
+docker network create noda-net
+
+# Node 1 — main node with faucet
+docker run -d --name node1 --network noda-net \
+  -p 3000:3000 \
+  -e FAUCET_KEY="your_hex_private_key" \
+  noda
+
+# Node 2 — peers with node 1
+docker run -d --name node2 --network noda-net \
+  -p 3001:3001 \
+  -e PORT=3001 \
+  -e PEERS="http://node1:3000" \
+  noda
+
+# Node 3 — peers with both
+docker run -d --name node3 --network noda-net \
+  -p 3002:3002 \
+  -e PORT=3002 \
+  -e PEERS="http://node1:3000,http://node2:3001" \
+  noda
+```
+
+---
+
+## How to Deploy to Render
+
+[Render](https://render.com) supports Docker-based deployments natively.
+
+### Option 1: Deploy via Render Dashboard
+
+1. Push this repo to GitHub.
+2. Go to [Render Dashboard](https://dashboard.render.com) → **New** → **Web Service**.
+3. Connect your GitHub repository.
+4. Render auto-detects the `Dockerfile` — no extra config needed.
+5. Set environment variables in the Render dashboard:
+
+   | Key          | Value                        |
+   |--------------|------------------------------|
+   | `PORT`       | `10000` (Render assigns this)|
+   | `DATA_FILE`  | `/app/node_data.json`        |
+   | `FAUCET_KEY` | `your_hex_private_key`       |
+   | `PEERS`      | `https://other-node.onrender.com` |
+
+6. Click **Deploy**.
+
+> **Note:** Render automatically sets the `PORT` environment variable. Noda reads it automatically — no code changes needed.
+
+### Option 2: Deploy with `render.yaml`
+
+Create a `render.yaml` in the repo root:
+
+```yaml
+services:
+  - type: web
+    name: noda
+    runtime: docker
+    plan: free
+    envVars:
+      - key: DATA_FILE
+        value: /app/node_data.json
+      - key: FAUCET_KEY
+        sync: false  # set manually in dashboard for security
+```
+
+Then connect the repo in Render and it will pick up the config.
+
+---
 
 ## API Endpoints
 
@@ -219,7 +356,9 @@ curl -s -X POST http://localhost:3000/sync | jq
 
 ```
 .
-├── main.go              # Entry point — CLI flags, component wiring
+├── main.go              # Entry point — env vars, CLI flags, component wiring
+├── Dockerfile           # Multi-stage Docker build (golang:alpine → alpine)
+├── .dockerignore        # Excludes unnecessary files from Docker context
 ├── crypto/
 │   └── crypto.go        # Ed25519 key gen, signing, verification, SignTransaction
 ├── chain/
@@ -277,6 +416,8 @@ All important events are logged to stderr with structured prefixes:
 - **JSON storage**: human-readable, easy to debug; fine for a lightweight node
 - **No external dependencies**: uses only the Go standard library
 - **Faucet**: simplifies testing — no need to manually sign genesis transactions
+- **Environment variables**: cloud-native config — works with Docker, Render, Railway, Fly.io, etc.
+- **Multi-stage Docker build**: ~15 MB final image, non-root user, health check included
 
 ## License
 
