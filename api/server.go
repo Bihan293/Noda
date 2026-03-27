@@ -233,12 +233,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"block_height":  ch.Height(),
 		"chain_length":  ch.Len(),
 		"peers":         len(s.Network.GetPeers()),
+		"http_peers":    len(s.Network.GetPeers()),
 		"total_mined":   ch.TotalMined,
 		"block_reward":  s.Ledger.GetBlockReward(),
 		"total_faucet":  ch.TotalFaucet,
 		"faucet_active": s.Ledger.IsFaucetActive(),
 		"mempool_size":  s.Ledger.GetMempoolSize(),
 		"utxo_count":    s.Ledger.UTXOSet.Size(),
+		"p2p_peers":     s.Network.PeerCount(),
 	}
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
