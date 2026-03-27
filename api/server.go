@@ -1,7 +1,11 @@
 // Package api provides the HTTP server with JSON endpoints for interacting
-// with the cryptocurrency node. All endpoints return JSON responses.
+// with the cryptocurrency node.
 //
-// Updated for block-based chain with PoW, halving, and new faucet logic.
+// Updated for:
+//   - UTXO-based balance queries
+//   - Mempool status and pending transactions
+//   - Faucet with global 11M cap (no per-address cooldown)
+//   - Block-based chain with PoW, halving
 package api
 
 import (
@@ -79,7 +83,7 @@ type KeyPairResponse struct {
 
 // ---------- Handlers ----------
 
-// handleBalance returns the balance for a given address.
+// handleBalance returns the balance for a given address (from UTXO set).
 // GET /balance?address=<hex_pubkey>
 func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -92,9 +96,13 @@ func (s *Server) handleBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	balance := s.Ledger.GetBalance(addr)
+	pendingSpend := s.Ledger.Mempool.GetSpendingTotal(addr)
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"address": addr,
-		"balance": balance,
+		"address":         addr,
+		"balance":         balance,
+		"pending_spend":   pendingSpend,
+		"available":       balance - pendingSpend,
+		"utxo_count":      len(s.Ledger.UTXOSet.GetUTXOsForAddress(addr)),
 	})
 }
 
@@ -122,7 +130,7 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 		Signature: req.Signature,
 	}
 
-	if err := s.Ledger.ValidateAndProcessUserTx(tx); err != nil {
+	if err := s.Ledger.SubmitTransaction(tx); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -212,7 +220,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStatus returns node status including block height, mining info, and faucet state.
+// handleStatus returns node status including block height, mining info, mempool, UTXO, and faucet state.
 // GET /status
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -229,6 +237,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"block_reward":  s.Ledger.GetBlockReward(),
 		"total_faucet":  ch.TotalFaucet,
 		"faucet_active": s.Ledger.IsFaucetActive(),
+		"mempool_size":  s.Ledger.GetMempoolSize(),
+		"utxo_count":    s.Ledger.UTXOSet.Size(),
 	}
 	if addr := s.Ledger.FaucetAddress(); addr != "" {
 		resp["faucet_address"] = addr
@@ -236,6 +246,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp["faucet_remaining"] = s.Ledger.FaucetRemaining()
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// handleMempool returns the current mempool state.
+// GET /mempool
+func (s *Server) handleMempool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		errorResponse(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	pending := s.Ledger.GetPendingTransactions(100)
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"size":         s.Ledger.GetMempoolSize(),
+		"transactions": pending,
+	})
 }
 
 // handleSign signs a transaction and returns it without broadcasting.
@@ -348,7 +372,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[SEND] Processing: %s -> %s (%.2f coins)", shortAddr(from), shortAddr(req.To), req.Amount)
 
-	if err := s.Ledger.ValidateAndProcessUserTx(tx); err != nil {
+	if err := s.Ledger.SubmitTransaction(tx); err != nil {
 		errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -369,6 +393,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 // handleFaucet sends free coins to a given address.
 // POST /faucet — body: {"to": "..."}
+// No per-address cooldown — only global 11M cap applies.
 func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
@@ -425,6 +450,7 @@ func (s *Server) Start() error {
 	// Utility endpoints
 	mux.HandleFunc("/generate-keys", s.handleGenerateKeys)
 	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/mempool", s.handleMempool)
 
 	// Peer management
 	mux.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
@@ -441,7 +467,7 @@ func (s *Server) Start() error {
 
 	addr := ":" + s.Port
 	log.Printf("=== Noda Node listening on http://0.0.0.0%s ===", addr)
-	log.Printf("Endpoints: /balance /transaction /chain /sign /send /faucet /generate-keys /status /peers /sync")
+	log.Printf("Endpoints: /balance /transaction /chain /sign /send /faucet /generate-keys /status /mempool /peers /sync")
 
 	return http.ListenAndServe(addr, loggingMiddleware(mux))
 }

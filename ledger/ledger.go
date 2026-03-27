@@ -1,12 +1,14 @@
-// Package ledger manages account balances and validates transactions.
-// It maintains an in-memory balance map rebuilt from the blockchain and provides
-// persistence by saving/loading to a JSON file on disk.
+// Package ledger manages the blockchain, UTXO set, mempool, and validates transactions.
 //
-// The ledger supports:
-//   - Block-based transaction processing
-//   - Faucet: 5,000 coins per request, global cap 11,000,000 total
+// It combines:
+//   - Blockchain (ordered sequence of blocks)
+//   - UTXO set (unspent transaction outputs for balance tracking)
+//   - Mempool (pool of unconfirmed transactions)
+//   - Faucet: 5,000 coins per request, global cap 11,000,000 total (no per-address cooldown)
 //   - Mining rewards with halving
-//   - Balance tracking from block transactions
+//
+// The ledger uses UTXO for balance computation instead of a flat account map.
+// Per-address faucet cooldown is removed; the only limit is the global 11M cap.
 package ledger
 
 import (
@@ -20,6 +22,8 @@ import (
 	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/chain"
 	"github.com/Bihan293/Noda/crypto"
+	"github.com/Bihan293/Noda/mempool"
+	"github.com/Bihan293/Noda/utxo"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -31,45 +35,59 @@ const (
 	StorageFile = "node_data.json"
 
 	// FaucetAmount is how many coins the faucet distributes per request.
-	// Updated from 50 → 5,000 as per new tokenomics.
 	FaucetAmount = 5000.0
 
 	// FaucetGlobalCap is the maximum total coins that can be distributed via faucet.
+	// Once 11,000,000 coins have been distributed, the faucet is permanently disabled.
 	FaucetGlobalCap = 11_000_000.0
-
-	// FaucetCooldown is the minimum time between faucet requests for the same address.
-	FaucetCooldown = 60 * time.Second
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Ledger
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Ledger holds the full blockchain, the balance map, and state for faucet/mining.
+// Ledger holds the full blockchain, UTXO set, mempool, and faucet state.
 type Ledger struct {
 	Chain    *chain.Blockchain  `json:"chain"`
-	Balances map[string]float64 `json:"balances"`
+	Balances map[string]float64 `json:"balances"` // kept for JSON compat; rebuilt from UTXO
 	mu       sync.RWMutex
 	filePath string
 
+	// UTXO set — the source of truth for balances.
+	UTXOSet *utxo.Set `json:"-"` // rebuilt from chain, not persisted as JSON field
+
+	// Mempool — unconfirmed transaction pool.
+	Mempool *mempool.Mempool `json:"-"` // transient, not persisted
+
 	// Faucet state
-	faucetPrivKey  string            // hex-encoded Ed25519 private key for faucet wallet
-	faucetAddress  string            // derived from faucetPrivKey
-	faucetCooldown map[string]time.Time // address -> last faucet claim time
+	faucetPrivKey string // hex-encoded Ed25519 private key for faucet wallet
+	faucetAddress string // derived from faucetPrivKey
 }
 
-// NewLedger creates a new ledger with a genesis blockchain and initial balances.
+// NewLedger creates a new ledger with a genesis blockchain, UTXO set, and mempool.
 func NewLedger(filePath string) *Ledger {
-	l := &Ledger{
-		Chain:          chain.NewBlockchain(),
-		Balances:       make(map[string]float64),
-		filePath:       filePath,
-		faucetCooldown: make(map[string]time.Time),
+	bc := chain.NewBlockchain()
+
+	// Build UTXO set from genesis block.
+	utxoSet, err := utxo.RebuildFromBlocks(bc.Blocks)
+	if err != nil {
+		log.Printf("[LEDGER] Warning: UTXO rebuild failed: %v — starting with empty set", err)
+		utxoSet = utxo.NewSet()
 	}
-	// Genesis gives all coins to the genesis address.
-	l.Balances[block.GenesisAddress] = block.GenesisSupply
-	log.Printf("[LEDGER] New ledger created — genesis supply: %.0f coins at %s",
-		block.GenesisSupply, block.GenesisAddress)
+
+	// Derive balances from UTXO.
+	balances := utxoSet.AllBalances()
+
+	l := &Ledger{
+		Chain:    bc,
+		Balances: balances,
+		filePath: filePath,
+		UTXOSet:  utxoSet,
+		Mempool:  mempool.New(mempool.DefaultMaxSize),
+	}
+
+	log.Printf("[LEDGER] New ledger created — genesis supply: %.0f coins at %s, UTXO count: %d",
+		block.GenesisSupply, block.GenesisAddress, utxoSet.Size())
 	return l
 }
 
@@ -120,106 +138,26 @@ func (l *Ledger) FaucetRemaining() float64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Balance Queries
+// Balance Queries (from UTXO set)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// GetBalance returns the balance for a given address (0 if unknown).
+// GetBalance returns the balance for a given address from the UTXO set.
 func (l *Ledger) GetBalance(address string) float64 {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.Balances[address]
+	return l.UTXOSet.Balance(address)
 }
 
-// GetAllBalances returns a copy of the balances map (safe for serialization).
+// GetAllBalances returns a copy of all balances derived from the UTXO set.
 func (l *Ledger) GetAllBalances() map[string]float64 {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	cp := make(map[string]float64, len(l.Balances))
-	for k, v := range l.Balances {
-		cp[k] = v
-	}
-	return cp
+	return l.UTXOSet.AllBalances()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Transaction Processing (within blocks)
+// Transaction Validation
 // ──────────────────────────────────────────────────────────────────────────────
 
-// ProcessTransaction validates a single transaction and applies it to balances.
-// This is used for transactions within a block (not standalone flat transactions).
-//
-// Validation rules:
-//  1. Amount must be positive.
-//  2. From and To addresses must be non-empty (except coinbase).
-//  3. Sender and receiver must differ.
-//  4. The signature must be valid (Ed25519 over "from:to:amount").
-//  5. The sender must have sufficient balance.
-func (l *Ledger) ProcessTransaction(tx block.Transaction) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.processTransactionLocked(tx)
-}
-
-// processTransactionLocked does the actual validation and balance update.
-// Must be called with l.mu held.
-func (l *Ledger) processTransactionLocked(tx block.Transaction) error {
-	// --- Basic field validation ---
-	if tx.Amount <= 0 {
-		log.Printf("[TX REJECTED] invalid amount %.6f from %s", tx.Amount, shortAddr(tx.From))
-		return fmt.Errorf("invalid amount: must be positive, got %f", tx.Amount)
-	}
-
-	// Coinbase transactions are handled separately.
-	if tx.From == "" {
-		// This is a coinbase or genesis — credit the recipient.
-		l.Balances[tx.To] += tx.Amount
-		return nil
-	}
-
-	if tx.To == "" {
-		log.Printf("[TX REJECTED] missing 'to' address from %s", shortAddr(tx.From))
-		return fmt.Errorf("invalid addresses: 'to' is required")
-	}
-	if tx.From == tx.To {
-		log.Printf("[TX REJECTED] self-send from %s", shortAddr(tx.From))
-		return fmt.Errorf("invalid transaction: cannot send to yourself")
-	}
-
-	// --- Signature verification ---
-	msg := fmt.Sprintf("%s:%s:%f", tx.From, tx.To, tx.Amount)
-	if !crypto.Verify(tx.From, []byte(msg), tx.Signature) {
-		log.Printf("[TX REJECTED] invalid signature from %s -> %s (%.2f coins)",
-			shortAddr(tx.From), shortAddr(tx.To), tx.Amount)
-		return fmt.Errorf("invalid signature: Ed25519 verification failed for sender %s", shortAddr(tx.From))
-	}
-
-	// --- Balance check ---
-	senderBalance := l.Balances[tx.From]
-	if senderBalance < tx.Amount {
-		log.Printf("[TX REJECTED] insufficient balance: %s has %.2f, needs %.2f",
-			shortAddr(tx.From), senderBalance, tx.Amount)
-		return fmt.Errorf("insufficient balance: address %s has %.6f coins, tried to send %.6f",
-			shortAddr(tx.From), senderBalance, tx.Amount)
-	}
-
-	// --- Apply transfer ---
-	l.Balances[tx.From] -= tx.Amount
-	l.Balances[tx.To] += tx.Amount
-
-	log.Printf("[TX ACCEPTED] %s -> %s : %.2f coins",
-		shortAddr(tx.From), shortAddr(tx.To), tx.Amount)
-
-	return nil
-}
-
-// ValidateAndProcessUserTx validates a user-submitted transaction (not coinbase),
-// adds it as a single-tx block to the chain, and persists.
-// This is the main entry point for POST /transaction and POST /send.
-func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Validate first (without applying).
+// ValidateUserTx checks a user-submitted transaction without applying it.
+// Validates: amount, addresses, signature, UTXO balance, mempool double-spend.
+func (l *Ledger) ValidateUserTx(tx block.Transaction) error {
 	if tx.Amount <= 0 {
 		return fmt.Errorf("invalid amount: must be positive, got %f", tx.Amount)
 	}
@@ -236,18 +174,61 @@ func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
 		return fmt.Errorf("invalid signature: Ed25519 verification failed for sender %s", shortAddr(tx.From))
 	}
 
-	// Balance check.
-	senderBalance := l.Balances[tx.From]
-	if senderBalance < tx.Amount {
-		return fmt.Errorf("insufficient balance: address %s has %.6f coins, tried to send %.6f",
-			shortAddr(tx.From), senderBalance, tx.Amount)
+	// Balance check using UTXO set.
+	utxoBalance := l.UTXOSet.Balance(tx.From)
+	// Account for pending spends in the mempool.
+	pendingSpend := l.Mempool.GetSpendingTotal(tx.From)
+	availableBalance := utxoBalance - pendingSpend
+
+	if availableBalance < tx.Amount {
+		return fmt.Errorf("insufficient balance: address %s has %.6f available (%.6f UTXO - %.6f pending), tried to send %.6f",
+			shortAddr(tx.From), availableBalance, utxoBalance, pendingSpend, tx.Amount)
+	}
+
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Transaction Processing
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SubmitTransaction validates a user transaction and adds it to the mempool.
+// Then creates a block containing the transaction (single-tx block for now).
+func (l *Ledger) SubmitTransaction(tx block.Transaction) error {
+	// Validate the transaction.
+	if err := l.ValidateUserTx(tx); err != nil {
+		return err
 	}
 
 	// Set timestamp and compute ID.
 	tx.Timestamp = time.Now().Unix()
 	tx.ID = block.HashTransaction(tx)
 
-	// Create a block containing this transaction.
+	// Add to mempool.
+	if err := l.Mempool.Add(tx); err != nil {
+		return fmt.Errorf("mempool rejection: %w", err)
+	}
+
+	// Mine a block containing this transaction.
+	if err := l.mineBlockWithTx(tx); err != nil {
+		// Remove from mempool on failure.
+		l.Mempool.Remove(tx.ID)
+		return err
+	}
+
+	return nil
+}
+
+// ValidateAndProcessUserTx is the legacy entry point — wraps SubmitTransaction.
+func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
+	return l.SubmitTransaction(tx)
+}
+
+// mineBlockWithTx creates and mines a block containing a single transaction.
+func (l *Ledger) mineBlockWithTx(tx block.Transaction) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	txIDs := []string{tx.ID}
 	merkleRoot := block.ComputeMerkleRoot(txIDs)
 
@@ -267,7 +248,7 @@ func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
 		Transactions: []block.Transaction{tx},
 	}
 
-	// Mine the block (for user transactions, use a generous attempt limit).
+	// Mine the block.
 	if err := block.MineBlock(newBlock, target, 10_000_000); err != nil {
 		return fmt.Errorf("mining failed for user tx block: %w", err)
 	}
@@ -277,24 +258,73 @@ func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
 		return fmt.Errorf("failed to add block: %w", err)
 	}
 
-	// Apply balance changes.
-	l.Balances[tx.From] -= tx.Amount
-	l.Balances[tx.To] += tx.Amount
+	// Apply block to UTXO set.
+	if err := l.UTXOSet.ApplyBlock(newBlock); err != nil {
+		return fmt.Errorf("UTXO update failed: %w", err)
+	}
 
-	log.Printf("[TX ACCEPTED] %s -> %s : %.2f coins (block height: %d)",
-		shortAddr(tx.From), shortAddr(tx.To), tx.Amount, newBlock.Header.Height)
+	// Remove transaction from mempool.
+	l.Mempool.Remove(tx.ID)
+
+	// Update balance cache from UTXO.
+	l.Balances = l.UTXOSet.AllBalances()
+
+	log.Printf("[TX ACCEPTED] %s -> %s : %.2f coins (block height: %d, UTXO size: %d)",
+		shortAddr(tx.From), shortAddr(tx.To), tx.Amount, newBlock.Header.Height, l.UTXOSet.Size())
 
 	// Persist.
 	_ = l.saveLocked()
 	return nil
 }
 
+// ProcessTransaction validates a single transaction and applies it to balances.
+// Used for processing transactions within a received block (not user-submitted).
+func (l *Ledger) ProcessTransaction(tx block.Transaction) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if tx.Amount <= 0 {
+		return fmt.Errorf("invalid amount: must be positive, got %f", tx.Amount)
+	}
+
+	// Coinbase: just credit.
+	if tx.From == "" {
+		l.Balances[tx.To] += tx.Amount
+		return nil
+	}
+
+	if tx.To == "" {
+		return fmt.Errorf("invalid addresses: 'to' is required")
+	}
+	if tx.From == tx.To {
+		return fmt.Errorf("invalid transaction: cannot send to yourself")
+	}
+
+	// Signature verification.
+	msg := fmt.Sprintf("%s:%s:%f", tx.From, tx.To, tx.Amount)
+	if !crypto.Verify(tx.From, []byte(msg), tx.Signature) {
+		return fmt.Errorf("invalid signature: Ed25519 verification failed for sender %s", shortAddr(tx.From))
+	}
+
+	// Balance check.
+	senderBalance := l.Balances[tx.From]
+	if senderBalance < tx.Amount {
+		return fmt.Errorf("insufficient balance: address %s has %.6f coins, tried to send %.6f",
+			shortAddr(tx.From), senderBalance, tx.Amount)
+	}
+
+	l.Balances[tx.From] -= tx.Amount
+	l.Balances[tx.To] += tx.Amount
+	return nil
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Faucet
+// Faucet — Global cap 11M, 5000 coins/request, no per-address cooldown
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ProcessFaucet sends FaucetAmount coins from the faucet wallet to the given address.
-// Enforces per-address cooldown and global faucet cap preparation.
+// Enforces only the global faucet cap (11M total). No per-address cooldown.
+// Multiple claims allowed from any address until the global cap is reached.
 func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 	// Check faucet is configured.
 	if l.faucetPrivKey == "" || l.faucetAddress == "" {
@@ -314,7 +344,7 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 	l.mu.RUnlock()
 
 	if totalDistributed >= FaucetGlobalCap {
-		return nil, fmt.Errorf("faucet exhausted: all %.0f coins have been distributed", FaucetGlobalCap)
+		return nil, fmt.Errorf("faucet exhausted: all %.0f coins have been distributed — faucet is permanently disabled", FaucetGlobalCap)
 	}
 
 	// Calculate actual amount (may be less than FaucetAmount near the cap).
@@ -324,17 +354,11 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 		amount = remaining
 	}
 
-	// Check cooldown.
-	l.mu.Lock()
-	lastClaim, exists := l.faucetCooldown[toAddress]
-	if exists && time.Since(lastClaim) < FaucetCooldown {
-		remaining := FaucetCooldown - time.Since(lastClaim)
-		l.mu.Unlock()
-		log.Printf("[FAUCET REJECTED] cooldown active for %s (%.0fs remaining)",
-			shortAddr(toAddress), remaining.Seconds())
-		return nil, fmt.Errorf("faucet cooldown: try again in %.0f seconds", remaining.Seconds())
+	// Check faucet wallet has enough balance.
+	faucetBalance := l.UTXOSet.Balance(l.faucetAddress)
+	if faucetBalance < amount {
+		return nil, fmt.Errorf("faucet wallet insufficient balance: has %.2f, needs %.2f", faucetBalance, amount)
 	}
-	l.mu.Unlock()
 
 	// Sign the transaction.
 	sig, err := crypto.SignTransaction(l.faucetPrivKey, l.faucetAddress, toAddress, amount)
@@ -350,14 +374,13 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 	}
 
 	// Process through normal validation (creates a block).
-	if err := l.ValidateAndProcessUserTx(tx); err != nil {
+	if err := l.SubmitTransaction(tx); err != nil {
 		return nil, fmt.Errorf("faucet transaction failed: %w", err)
 	}
 
 	// Update faucet tracking.
 	l.mu.Lock()
 	l.Chain.TotalFaucet += amount
-	l.faucetCooldown[toAddress] = time.Now()
 	l.mu.Unlock()
 
 	log.Printf("[FAUCET] Sent %.0f coins to %s (total distributed: %.0f / %.0f)",
@@ -371,6 +394,7 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ReplaceChain replaces the current chain if the new one is longer and valid.
+// Rebuilds the UTXO set from the new chain.
 func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -385,42 +409,24 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 		return false
 	}
 
-	// Rebuild balances from the new chain.
-	balances, err := rebuildBalances(newChain)
+	// Rebuild UTXO set from the new chain.
+	newUTXO, err := utxo.RebuildFromBlocks(newChain.Blocks)
 	if err != nil {
-		log.Printf("[SYNC REJECTED] balance rebuild failed: %v", err)
+		log.Printf("[SYNC REJECTED] UTXO rebuild failed: %v", err)
 		return false
 	}
 
+	// Rebuild balances from UTXO.
+	balances := newUTXO.AllBalances()
+
 	l.Chain = newChain
+	l.UTXOSet = newUTXO
 	l.Balances = balances
 	_ = l.saveLocked()
 
-	log.Printf("[SYNC] Chain replaced — new length: %d blocks", newChain.Len())
+	log.Printf("[SYNC] Chain replaced — new length: %d blocks, UTXO: %d outputs",
+		newChain.Len(), newUTXO.Size())
 	return true
-}
-
-// rebuildBalances replays all block transactions to compute account balances.
-func rebuildBalances(bc *chain.Blockchain) (map[string]float64, error) {
-	balances := make(map[string]float64)
-
-	for _, b := range bc.Blocks {
-		for _, tx := range b.Transactions {
-			if tx.From == "" {
-				// Coinbase or genesis — credit the recipient.
-				balances[tx.To] += tx.Amount
-				continue
-			}
-			// Regular transaction.
-			if balances[tx.From] < tx.Amount {
-				return nil, fmt.Errorf("block %d: insufficient balance for %s",
-					b.Header.Height, shortAddr(tx.From))
-			}
-			balances[tx.From] -= tx.Amount
-			balances[tx.To] += tx.Amount
-		}
-	}
-	return balances, nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -457,7 +463,6 @@ func LoadLedger(filePath string) *Ledger {
 		return NewLedger(filePath)
 	}
 	l.filePath = filePath
-	l.faucetCooldown = make(map[string]time.Time)
 	if l.Balances == nil {
 		l.Balances = make(map[string]float64)
 	}
@@ -471,7 +476,26 @@ func LoadLedger(filePath string) *Ledger {
 		}
 	}
 
-	log.Printf("[LEDGER] Loaded %d blocks from %s", l.Chain.Len(), filePath)
+	// Rebuild UTXO set from the loaded chain.
+	if l.Chain != nil {
+		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
+		if err != nil {
+			log.Printf("[LEDGER] UTXO rebuild failed: %v — using balance map fallback", err)
+			utxoSet = utxo.NewSet()
+		} else {
+			// Sync balances from UTXO set.
+			l.Balances = utxoSet.AllBalances()
+		}
+		l.UTXOSet = utxoSet
+	} else {
+		l.UTXOSet = utxo.NewSet()
+	}
+
+	// Initialize mempool (transient, not persisted).
+	l.Mempool = mempool.New(mempool.DefaultMaxSize)
+
+	log.Printf("[LEDGER] Loaded %d blocks from %s — UTXO: %d outputs",
+		l.Chain.Len(), filePath, l.UTXOSet.Size())
 	return &l
 }
 
@@ -496,6 +520,16 @@ func (l *Ledger) GetChainHeight() uint64 {
 // GetBlockReward returns the mining reward for the next block.
 func (l *Ledger) GetBlockReward() float64 {
 	return l.Chain.GetBlockReward()
+}
+
+// GetMempoolSize returns the number of transactions in the mempool.
+func (l *Ledger) GetMempoolSize() int {
+	return l.Mempool.Size()
+}
+
+// GetPendingTransactions returns up to limit pending transactions from the mempool.
+func (l *Ledger) GetPendingTransactions(limit int) []block.Transaction {
+	return l.Mempool.GetPending(limit)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -5,7 +5,9 @@
 //   - Merkle Tree for transaction inclusion proofs
 //   - Dynamic difficulty adjustment (every 2016 blocks)
 //   - Block reward with halving (50 coins, halving every 210,000 blocks)
-//   - Faucet: 5,000 coins per request, global cap 11,000,000
+//   - UTXO set for balance tracking and double-spend prevention
+//   - Mempool for unconfirmed transaction management
+//   - Faucet: 5,000 coins per request, global cap 11,000,000 (no per-address cooldown)
 //   - Mining rewards up to 10,000,000 (total supply cap: 21,000,000)
 //   - Ed25519 cryptography for transaction signing
 //   - HTTP API for wallet interactions
@@ -78,14 +80,17 @@ func main() {
 	// ---- Initialize components ----
 	log.Println("╔══════════════════════════════════════════════╗")
 	log.Println("║       Noda Crypto Node — Bitcoin-like        ║")
+	log.Println("║     UTXO + Mempool + Faucet (11M cap)       ║")
 	log.Println("╚══════════════════════════════════════════════╝")
 	log.Printf("  Port:          %s", *port)
 	log.Printf("  Data:          %s", *dataFile)
 	log.Printf("  Peers:         %v", peers)
 
-	// Load or create ledger (chain + balances).
+	// Load or create ledger (chain + UTXO + mempool).
 	l := ledger.LoadLedger(*dataFile)
 	log.Printf("  Chain:         %d blocks (height: %d)", l.GetChain().Len(), l.GetChainHeight())
+	log.Printf("  UTXO Set:      %d unspent outputs", l.UTXOSet.Size())
+	log.Printf("  Mempool:       %d pending transactions", l.GetMempoolSize())
 	log.Printf("  Block Reward:  %.2f coins", l.GetBlockReward())
 	log.Printf("  Max Supply:    %.0f coins (%.0f faucet + %.0f mining)",
 		block.MaxTotalSupply, block.GenesisSupply, block.MaxMiningSupply)
@@ -108,7 +113,8 @@ func main() {
 	if len(peers) > 0 {
 		log.Println("[SYNC] Fetching chain from peers...")
 		if net.SyncChain(l) {
-			log.Printf("[SYNC] Chain updated from peers — height: %d", l.GetChainHeight())
+			log.Printf("[SYNC] Chain updated from peers — height: %d, UTXO: %d",
+				l.GetChainHeight(), l.UTXOSet.Size())
 		} else {
 			log.Println("[SYNC] Local chain is up to date")
 		}
