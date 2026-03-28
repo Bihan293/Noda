@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -1174,6 +1175,227 @@ func TestUTXORollback(t *testing.T) {
 	genesisBalance := utxoSet.Balance(block.LegacyGenesisAddress)
 	if genesisBalance != block.GenesisSupply {
 		t.Errorf("genesis balance after rollback = %f, want %f", genesisBalance, block.GenesisSupply)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-1: Blockstore persistence — restart recovers full state
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBlockstoreRestartPersistence(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	// Use a persistent path so we can "restart".
+	path := tmpFile(t)
+
+	// Session 1: create ledger, send faucet, mine a block.
+	l1 := ledger.NewLedgerWithOwner(path, kp.Address)
+	if err := l1.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatalf("SetFaucetKeyAndValidateGenesis: %v", err)
+	}
+
+	recvKP, _ := crypto.GenerateKeyPair()
+	_, err = l1.ProcessFaucet(recvKP.Address)
+	if err != nil {
+		t.Fatalf("ProcessFaucet: %v", err)
+	}
+
+	// Mine faucet tx.
+	cfg := miner.Config{
+		Enabled:      true,
+		MinerAddress: minerKP.Address,
+		BlockMaxTx:   100,
+		Interval:     50 * time.Millisecond,
+		MaxAttempts:  10_000_000,
+	}
+	mn := miner.New(cfg, l1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	go mn.Run(ctx)
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("miner did not process faucet tx")
+		default:
+			if l1.GetMempoolSize() == 0 && l1.GetChainHeight() > 0 {
+				goto mined
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+mined:
+	cancel()
+
+	heightBefore := l1.GetChainHeight()
+	recvBalanceBefore := l1.GetBalance(recvKP.Address)
+	minerBalanceBefore := l1.GetBalance(minerKP.Address)
+	totalMinedBefore := l1.GetChain().TotalMined
+	totalFaucetBefore := l1.GetChain().TotalFaucet
+
+	if heightBefore < 1 {
+		t.Fatal("should have at least height 1 after mining")
+	}
+	if recvBalanceBefore == 0 {
+		t.Fatal("receiver should have balance after mining")
+	}
+
+	// Save explicitly.
+	if err := l1.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Session 2: "restart" — reload from same path.
+	l2 := ledger.LoadLedgerWithOwner(path, kp.Address)
+
+	if l2.GetChainHeight() != heightBefore {
+		t.Errorf("height after restart: got %d, want %d", l2.GetChainHeight(), heightBefore)
+	}
+	if l2.GetBalance(recvKP.Address) != recvBalanceBefore {
+		t.Errorf("receiver balance after restart: got %f, want %f",
+			l2.GetBalance(recvKP.Address), recvBalanceBefore)
+	}
+	if l2.GetBalance(minerKP.Address) != minerBalanceBefore {
+		t.Errorf("miner balance after restart: got %f, want %f",
+			l2.GetBalance(minerKP.Address), minerBalanceBefore)
+	}
+	if l2.GetChain().TotalMined != totalMinedBefore {
+		t.Errorf("TotalMined after restart: got %f, want %f",
+			l2.GetChain().TotalMined, totalMinedBefore)
+	}
+	if l2.GetChain().TotalFaucet != totalFaucetBefore {
+		t.Errorf("TotalFaucet after restart: got %f, want %f",
+			l2.GetChain().TotalFaucet, totalFaucetBefore)
+	}
+	if l2.GenesisOwner() != kp.Address {
+		t.Errorf("GenesisOwner after restart: got %s, want %s",
+			l2.GenesisOwner(), kp.Address)
+	}
+	if l2.GetStore() == nil {
+		t.Error("Store should not be nil after restart")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-1: Rebuild UTXO from blockstore when chainstate is corrupted
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBlockstoreRebuildUTXOFromBlocks(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	path := tmpFile(t)
+
+	// Session 1: create chain with some activity.
+	l1 := ledger.NewLedgerWithOwner(path, kp.Address)
+	if err := l1.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatal(err)
+	}
+
+	recvKP, _ := crypto.GenerateKeyPair()
+	_, err = l1.ProcessFaucet(recvKP.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := miner.Config{
+		Enabled: true, MinerAddress: minerKP.Address,
+		BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+	}
+	mn := miner.New(cfg, l1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	go mn.Run(ctx)
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("miner timeout")
+		default:
+			if l1.GetMempoolSize() == 0 && l1.GetChainHeight() > 0 {
+				goto mined2
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+mined2:
+	cancel()
+	l1.Save()
+
+	recvBalance := l1.GetBalance(recvKP.Address)
+	minerBalance := l1.GetBalance(minerKP.Address)
+
+	// Corrupt the chainstate by deleting the UTXO file.
+	st := l1.GetStore()
+	if st == nil {
+		t.Fatal("store should not be nil")
+	}
+	chainstateDir := filepath.Join(st.DataDir(), "chainstate")
+	os.Remove(filepath.Join(chainstateDir, "utxo.json"))
+
+	// Session 2: reload — should rebuild UTXO from blockstore.
+	l2 := ledger.LoadLedgerWithOwner(path, kp.Address)
+
+	if l2.GetBalance(recvKP.Address) != recvBalance {
+		t.Errorf("receiver balance after rebuild: got %f, want %f",
+			l2.GetBalance(recvKP.Address), recvBalance)
+	}
+	if l2.GetBalance(minerKP.Address) != minerBalance {
+		t.Errorf("miner balance after rebuild: got %f, want %f",
+			l2.GetBalance(minerKP.Address), minerBalance)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HIGH-1: Recovery after partial write (temp file cleanup)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBlockstoreRecoveryAfterPartialWrite(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := tmpFile(t)
+
+	// Create ledger and save.
+	l1 := ledger.NewLedgerWithOwner(path, kp.Address)
+	l1.Save()
+
+	// Simulate a partial write by creating a .tmp file in the store.
+	st := l1.GetStore()
+	if st == nil {
+		t.Fatal("store should not be nil")
+	}
+	tmpPath := filepath.Join(st.DataDir(), "metadata.json.tmp")
+	os.WriteFile(tmpPath, []byte("incomplete"), 0644)
+
+	// Reload — the store should clean up the temp file.
+	l2 := ledger.LoadLedgerWithOwner(path, kp.Address)
+	if l2 == nil {
+		t.Fatal("LoadLedgerWithOwner returned nil")
+	}
+
+	// Temp file should be gone.
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Error("temp file should have been cleaned up during recovery")
+	}
+
+	// Data should be intact.
+	if l2.GetChainHeight() != 0 {
+		t.Errorf("height = %d, want 0", l2.GetChainHeight())
+	}
+	if l2.GenesisOwner() != kp.Address {
+		t.Errorf("genesis owner = %s, want %s", l2.GenesisOwner(), kp.Address)
 	}
 }
 

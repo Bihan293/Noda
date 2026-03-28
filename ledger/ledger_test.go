@@ -247,8 +247,11 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatalf("Save() error: %v", err)
 	}
 
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Fatal("Save() did not create file")
+	// HIGH-1: storage now uses a directory (blockstore), not a single JSON file.
+	// Verify the store directory was created.
+	storeDir := storeDirFromPath(path)
+	if _, err := os.Stat(storeDir); os.IsNotExist(err) {
+		t.Fatal("Save() did not create store directory")
 	}
 
 	l2 := LoadLedger(path)
@@ -263,6 +266,9 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if l2.Mempool == nil {
 		t.Error("loaded Mempool is nil")
+	}
+	if l2.GetStore() == nil {
+		t.Error("loaded Store is nil")
 	}
 }
 

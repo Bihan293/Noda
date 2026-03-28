@@ -17,6 +17,11 @@
 // SubmitTransaction only validates and adds to mempool.
 // Mining is performed by the separate miner package.
 //
+// HIGH-1: Persistence uses crash-safe blockstore + chainstate instead of
+// a monolithic JSON file. Blocks are stored individually; metadata and
+// UTXO chainstate are written atomically. Legacy node_data.json files
+// are migrated on first startup.
+//
 // Genesis ownership:
 //
 //	The genesis supply (11M) is assigned to an address derived from the configured
@@ -29,12 +34,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/Bihan293/Noda/block"
 	"github.com/Bihan293/Noda/chain"
 	"github.com/Bihan293/Noda/crypto"
 	"github.com/Bihan293/Noda/mempool"
+	"github.com/Bihan293/Noda/storage"
 	"github.com/Bihan293/Noda/utxo"
 )
 
@@ -43,8 +50,11 @@ import (
 // ──────────────────────────────────────────────────────────────────────────────
 
 const (
-	// StorageFile is the default file used to persist chain and balances.
+	// StorageFile is the default legacy file path (kept for backwards compat).
 	StorageFile = "node_data.json"
+
+	// StorageDir is the default directory for the new blockstore+chainstate storage.
+	StorageDir = "noda_data"
 
 	// FaucetAmount is how many coins the faucet distributes per request.
 	FaucetAmount = 5000.0
@@ -75,7 +85,10 @@ type Ledger struct {
 	Chain    *chain.Blockchain  `json:"chain"`
 	Balances map[string]float64 `json:"balances"` // kept for JSON compat; rebuilt from UTXO
 	mu       sync.RWMutex
-	filePath string
+	filePath string // legacy JSON path (kept for backward compat)
+
+	// HIGH-1: crash-safe storage engine
+	store *storage.Store
 
 	// UTXO set — the source of truth for balances.
 	UTXOSet *utxo.Set `json:"-"` // rebuilt from chain, not persisted as JSON field
@@ -96,7 +109,8 @@ func NewLedger(filePath string) *Ledger {
 
 // NewLedgerWithOwner creates a new ledger with a genesis blockchain where the
 // genesis supply (11M) belongs to the specified owner address.
-func NewLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
+// The storePath is used as the storage directory for the new blockstore.
+func NewLedgerWithOwner(storePath string, genesisOwner string) *Ledger {
 	bc := chain.NewBlockchainWithOwner(genesisOwner)
 
 	// Build UTXO set from genesis block.
@@ -109,18 +123,37 @@ func NewLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
 	// Derive balances from UTXO.
 	balances := utxoSet.AllBalances()
 
+	// Initialize storage engine.
+	var st *storage.Store
+	storeDir := storeDirFromPath(storePath)
+	st, err = storage.NewStore(storeDir)
+	if err != nil {
+		slog.Warn("Failed to initialize storage, persistence disabled", "error", err)
+	}
+
 	l := &Ledger{
 		Chain:    bc,
 		Balances: balances,
-		filePath: filePath,
+		filePath: storePath,
+		store:    st,
 		UTXOSet:  utxoSet,
 		Mempool:  mempool.New(mempool.DefaultMaxSize),
+	}
+
+	// Save genesis block and metadata to the new store.
+	if st != nil && len(bc.Blocks) > 0 {
+		for _, b := range bc.Blocks {
+			_ = st.SaveBlock(b)
+		}
+		_ = l.saveMetadataToStore()
+		_ = l.saveChainstateToStore()
 	}
 
 	slog.Info("New ledger created",
 		"genesis_supply", block.GenesisSupply,
 		"genesis_owner", genesisOwner,
 		"utxo_count", utxoSet.Size(),
+		"storage", storeDir,
 	)
 	return l
 }
@@ -145,6 +178,11 @@ func (l *Ledger) ApplyMinedBlock(b *block.Block, txIDs []string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Save block to blockstore first (before chain state update).
+	if err := l.saveBlockToStore(b); err != nil {
+		slog.Warn("Failed to save mined block to store", "error", err)
+	}
+
 	// Add block to chain.
 	if err := l.Chain.AddBlock(b); err != nil {
 		return fmt.Errorf("failed to add mined block: %w", err)
@@ -161,7 +199,7 @@ func (l *Ledger) ApplyMinedBlock(b *block.Block, txIDs []string) error {
 	// Update balance cache from UTXO.
 	l.Balances = l.UTXOSet.AllBalances()
 
-	// Persist.
+	// Persist metadata + chainstate.
 	_ = l.saveLocked()
 
 	slog.Info("Mined block applied",
@@ -292,6 +330,11 @@ func (l *Ledger) migrateLegacyGenesis(newOwnerAddress string) error {
 	l.Chain = bc
 	l.UTXOSet = utxoSet
 	l.Balances = utxoSet.AllBalances()
+
+	// Save genesis block to blockstore (HIGH-1).
+	if l.store != nil && len(bc.Blocks) > 0 {
+		_ = l.store.SaveBlock(bc.Blocks[0])
+	}
 
 	// Persist immediately.
 	if err := l.saveLocked(); err != nil {
@@ -743,6 +786,15 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	// Rebuild index.
 	l.Chain.RebuildIndex()
 
+	// Save all blocks to blockstore (HIGH-1).
+	if l.store != nil {
+		for _, b := range newChain.Blocks {
+			if !l.store.HasBlock(b.Hash) {
+				_ = l.store.SaveBlock(b)
+			}
+		}
+	}
+
 	_ = l.saveLocked()
 
 	slog.Info("Chain replaced (cumulative work)",
@@ -807,6 +859,11 @@ func (l *Ledger) ProcessBlock(b *block.Block) (accepted bool, isOrphan bool, err
 	result := idx.AddBlock(b)
 	if !result.Added {
 		return false, false, nil // duplicate
+	}
+
+	// Save block to blockstore (HIGH-1).
+	if err := l.saveBlockToStore(b); err != nil {
+		slog.Warn("Failed to save block to store", "height", b.Header.Height, "error", err)
 	}
 
 	if result.IsOrphan {
@@ -970,6 +1027,15 @@ func (l *Ledger) performReorgLocked(oldTipHash, newTipHash string) error {
 	l.Chain.RecalcTotalMined()
 	idx.UpdateMainChainStatus()
 
+	// Save new branch blocks to blockstore (HIGH-1).
+	if l.store != nil {
+		for _, node := range connect {
+			if node.Block != nil && !l.store.HasBlock(node.Block.Hash) {
+				_ = l.store.SaveBlock(node.Block)
+			}
+		}
+	}
+
 	_ = l.saveLocked()
 
 	slog.Info("Reorg completed",
@@ -998,18 +1064,70 @@ func (l *Ledger) GetBlockIndex() *chain.BlockIndex {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Persistence
+// Persistence — HIGH-1: crash-safe blockstore + chainstate
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Save persists the ledger to its JSON file (thread-safe wrapper).
+// Save persists the ledger state to the blockstore (thread-safe wrapper).
 func (l *Ledger) Save() error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.saveLocked()
 }
 
-// saveLocked writes chain + balances to disk. Must be called with lock held.
+// saveLocked writes metadata + chainstate to the store. Must be called with lock held.
+// Individual blocks are saved when they are added (not in bulk).
 func (l *Ledger) saveLocked() error {
+	if l.store == nil {
+		// Fallback to legacy JSON if store is not available.
+		return l.saveLegacyJSON()
+	}
+
+	if err := l.saveMetadataToStore(); err != nil {
+		slog.Warn("Failed to save metadata", "error", err)
+		return err
+	}
+	if err := l.saveChainstateToStore(); err != nil {
+		slog.Warn("Failed to save chainstate", "error", err)
+		return err
+	}
+	return nil
+}
+
+// saveMetadataToStore writes node metadata atomically.
+func (l *Ledger) saveMetadataToStore() error {
+	if l.store == nil {
+		return nil
+	}
+	meta := &storage.NodeMetadata{
+		BestTipHash:  l.Chain.LastHash(),
+		BestHeight:   l.Chain.Height(),
+		TargetHex:    l.Chain.TargetHex,
+		TotalMined:   l.Chain.TotalMined,
+		TotalFaucet:  l.Chain.TotalFaucet,
+		GenesisOwner: l.Chain.GenesisOwner,
+	}
+	return l.store.SaveMetadata(meta)
+}
+
+// saveChainstateToStore writes the UTXO set snapshot atomically.
+func (l *Ledger) saveChainstateToStore() error {
+	if l.store == nil || l.UTXOSet == nil {
+		return nil
+	}
+	snap := utxoSetToSnapshot(l.UTXOSet, l.Chain.Height(), l.Chain.LastHash())
+	return l.store.SaveChainstate(snap)
+}
+
+// saveBlockToStore saves a single block to the blockstore.
+func (l *Ledger) saveBlockToStore(b *block.Block) error {
+	if l.store == nil {
+		return nil
+	}
+	return l.store.SaveBlock(b)
+}
+
+// saveLegacyJSON is the fallback for when the store is not available.
+func (l *Ledger) saveLegacyJSON() error {
 	data, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
 		return err
@@ -1017,25 +1135,224 @@ func (l *Ledger) saveLocked() error {
 	return os.WriteFile(l.filePath, data, 0644)
 }
 
-// LoadLedger reads a ledger from a JSON file. Falls back to a new ledger on failure.
+// utxoSetToSnapshot converts a UTXO set to a storage snapshot.
+func utxoSetToSnapshot(s *utxo.Set, height uint64, hash string) *storage.ChainstateSnapshot {
+	allUTXOs := s.GetAllUTXOs()
+	entries := make([]storage.UTXOEntry, 0, len(allUTXOs))
+	for _, u := range allUTXOs {
+		entries = append(entries, storage.UTXOEntry{
+			TxID:    u.OutPoint.TxID,
+			Index:   u.OutPoint.Index,
+			Address: u.Output.Address,
+			Amount:  u.Output.Amount,
+		})
+	}
+	return &storage.ChainstateSnapshot{
+		Height: height,
+		Hash:   hash,
+		UTXOs:  entries,
+	}
+}
+
+// utxoSetFromSnapshot rebuilds a UTXO set from a storage snapshot.
+func utxoSetFromSnapshot(snap *storage.ChainstateSnapshot) *utxo.Set {
+	s := utxo.NewSet()
+	for _, entry := range snap.UTXOs {
+		op := utxo.OutPoint{TxID: entry.TxID, Index: entry.Index}
+		out := utxo.Output{Address: entry.Address, Amount: entry.Amount}
+		s.Add(op, out)
+	}
+	return s
+}
+
+// storeDirFromPath derives the storage directory from the legacy file path.
+// If the path ends with ".json", we use a sibling directory.
+// Otherwise, we use the path directly as the directory.
+func storeDirFromPath(path string) string {
+	if filepath.Ext(path) == ".json" {
+		dir := filepath.Dir(path)
+		base := filepath.Base(path)
+		name := base[:len(base)-len(filepath.Ext(base))]
+		return filepath.Join(dir, name+"_store")
+	}
+	return path + "_store"
+}
+
+// GetStore returns the underlying storage engine (may be nil).
+func (l *Ledger) GetStore() *storage.Store {
+	return l.store
+}
+
+// LoadLedger reads a ledger from the storage. Falls back to a new ledger on failure.
+// HIGH-1: First attempts to load from the new blockstore. If the blockstore is
+// empty, it checks for a legacy node_data.json and migrates it.
 func LoadLedger(filePath string) *Ledger {
+	return LoadLedgerWithOwner(filePath, block.LegacyGenesisAddress)
+}
+
+// LoadLedgerWithOwner reads a ledger from storage with a specific genesis owner.
+// If no data exists, creates a new chain with the given owner.
+// HIGH-1: Uses crash-safe blockstore + chainstate instead of monolithic JSON.
+func LoadLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
+	storeDir := storeDirFromPath(filePath)
+
+	// Initialize storage engine.
+	st, err := storage.NewStore(storeDir)
+	if err != nil {
+		slog.Error("Failed to initialize storage, falling back to legacy",
+			"error", err, "store_dir", storeDir)
+		return loadLedgerLegacy(filePath, genesisOwner)
+	}
+
+	// Attempt legacy migration if blockstore is empty.
+	if st.BlockCount() == 0 {
+		migrated, migrErr := st.MigrateFromLegacy(filePath)
+		if migrErr != nil {
+			slog.Warn("Legacy migration failed", "error", migrErr)
+		} else if migrated {
+			slog.Info("Legacy data migrated to new blockstore",
+				"legacy_path", filePath, "store_dir", storeDir)
+		}
+	}
+
+	// If blockstore is still empty, create a new chain.
+	if st.BlockCount() == 0 {
+		slog.Info("No stored data found, starting fresh with configured genesis owner",
+			"store_dir", storeDir, "genesis_owner", genesisOwner)
+		l := NewLedgerWithOwner(filePath, genesisOwner)
+		return l
+	}
+
+	// Load metadata.
+	meta, err := st.LoadMetadata()
+	if err != nil {
+		slog.Warn("Failed to load metadata, rebuilding from blockstore", "error", err)
+		meta = nil
+	}
+
+	// Load all blocks from blockstore (ordered by height).
+	blocks, err := st.LoadAllBlocksOrdered()
+	if err != nil {
+		slog.Error("Failed to load blocks from blockstore", "error", err)
+		return NewLedgerWithOwner(filePath, genesisOwner)
+	}
+
+	// Check for legacy chain data.
+	for _, b := range blocks {
+		if block.IsLegacyBlock(b) {
+			slog.Error("FATAL: blockstore contains legacy account-model transactions",
+				"block_height", b.Header.Height)
+			slog.Error("The chain data format is incompatible with the current UTXO input/output model.")
+			slog.Error("To migrate: delete the data directory and restart with a fresh chain.")
+			return NewLedgerWithOwner(filePath, genesisOwner)
+		}
+	}
+
+	// Reconstruct the Blockchain.
+	bc := &chain.Blockchain{
+		Blocks:  blocks,
+		Index:   chain.NewBlockIndex(),
+	}
+
+	// Apply metadata if available.
+	if meta != nil {
+		bc.TotalMined = meta.TotalMined
+		bc.TotalFaucet = meta.TotalFaucet
+		bc.GenesisOwner = meta.GenesisOwner
+		if meta.TargetHex != "" {
+			bc.Target = block.TargetFromBits(meta.TargetHex)
+			bc.TargetHex = meta.TargetHex
+		} else {
+			bc.Target = block.InitialTarget
+			bc.TargetHex = block.BitsFromTarget(block.InitialTarget)
+		}
+	} else {
+		bc.Target = block.InitialTarget
+		bc.TargetHex = block.BitsFromTarget(block.InitialTarget)
+		// Back-fill from genesis block.
+		if len(blocks) > 0 {
+			if owner, ok := block.GenesisOwnerFromBlock(blocks[0]); ok {
+				bc.GenesisOwner = owner
+			}
+		}
+	}
+
+	// Build block index.
+	bc.Index.BuildFromBlocks(blocks)
+
+	// Rebuild or load UTXO set.
+	var utxoSet *utxo.Set
+
+	// First try the chainstate snapshot.
+	snap, snapErr := st.LoadChainstate()
+	if snapErr == nil && snap != nil && snap.Hash == bc.LastHash() {
+		// Snapshot matches current tip — use it directly.
+		utxoSet = utxoSetFromSnapshot(snap)
+		slog.Info("UTXO set loaded from chainstate snapshot",
+			"height", snap.Height, "utxos", len(snap.UTXOs))
+	} else {
+		// Snapshot missing or stale — rebuild from blocks.
+		if snapErr != nil {
+			slog.Warn("Chainstate load failed, rebuilding UTXO from blockstore", "error", snapErr)
+		} else if snap != nil {
+			slog.Info("Chainstate snapshot stale, rebuilding UTXO from blockstore",
+				"snap_hash", shortAddr(snap.Hash), "tip_hash", shortAddr(bc.LastHash()))
+		} else {
+			slog.Info("No chainstate snapshot, rebuilding UTXO from blockstore")
+		}
+		utxoSet, err = utxo.RebuildFromBlocks(blocks)
+		if err != nil {
+			slog.Warn("UTXO rebuild from blockstore failed", "error", err)
+			utxoSet = utxo.NewSet()
+		}
+	}
+
+	balances := utxoSet.AllBalances()
+
+	l := &Ledger{
+		Chain:    bc,
+		Balances: balances,
+		filePath: filePath,
+		store:    st,
+		UTXOSet:  utxoSet,
+		Mempool:  mempool.New(mempool.DefaultMaxSize),
+	}
+
+	// Save updated chainstate if it was rebuilt.
+	if snap == nil || (snap != nil && snap.Hash != bc.LastHash()) {
+		_ = l.saveChainstateToStore()
+	}
+
+	slog.Info("Ledger loaded from blockstore",
+		"blocks", bc.Len(),
+		"store_dir", storeDir,
+		"utxo_count", utxoSet.Size(),
+		"genesis_owner", l.GenesisOwner(),
+	)
+	return l
+}
+
+// loadLedgerLegacy is the fallback loader using the old monolithic JSON format.
+// Used only when the new storage engine cannot be initialized.
+func loadLedgerLegacy(filePath string, genesisOwner string) *Ledger {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		slog.Info("No data file found, starting fresh", "path", filePath)
-		return NewLedger(filePath)
+		slog.Info("No legacy data file found, starting fresh",
+			"path", filePath, "genesis_owner", genesisOwner)
+		return newLedgerWithOwnerNoStore(filePath, genesisOwner)
 	}
 
 	var l Ledger
 	if err := json.Unmarshal(data, &l); err != nil {
-		slog.Warn("Failed to parse data file, starting fresh", "path", filePath, "error", err)
-		return NewLedger(filePath)
+		slog.Warn("Failed to parse legacy data file, starting fresh",
+			"path", filePath, "error", err)
+		return newLedgerWithOwnerNoStore(filePath, genesisOwner)
 	}
 	l.filePath = filePath
 	if l.Balances == nil {
 		l.Balances = make(map[string]float64)
 	}
 
-	// Rebuild chain target from hex if needed.
 	if l.Chain != nil && l.Chain.Target == nil {
 		if l.Chain.TargetHex != "" {
 			l.Chain.Target = block.TargetFromBits(l.Chain.TargetHex)
@@ -1044,37 +1361,26 @@ func LoadLedger(filePath string) *Ledger {
 		}
 	}
 
-	// Back-fill GenesisOwner from genesis block if metadata is missing (legacy data).
 	if l.Chain != nil && l.Chain.GenesisOwner == "" && len(l.Chain.Blocks) > 0 {
 		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
 			l.Chain.GenesisOwner = owner
-			slog.Info("Back-filled genesis owner from genesis block", "genesis_owner", owner)
 		}
 	}
 
-	// Check for legacy chain data — fail fast with clear instruction.
 	if l.Chain != nil {
 		if hasLegacy, height := chain.ContainsLegacyBlocks(l.Chain); hasLegacy {
-			slog.Error("FATAL: chain data contains legacy account-model transactions",
-				"block_height", height,
-				"data_file", filePath,
-			)
-			slog.Error("The chain data format is incompatible with the current UTXO input/output model.")
-			slog.Error("To migrate: delete the data file and restart with a fresh chain.")
-			slog.Error("Legacy data cannot be automatically converted — this is a breaking change.")
-			// Return a fresh ledger instead of crashing, but log the error prominently.
-			return NewLedger(filePath)
+			slog.Error("FATAL: legacy chain data contains account-model transactions",
+				"block_height", height)
+			return newLedgerWithOwnerNoStore(filePath, genesisOwner)
 		}
 	}
 
-	// Rebuild UTXO set from the loaded chain.
 	if l.Chain != nil {
 		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
 		if err != nil {
-			slog.Warn("UTXO rebuild failed, using balance map fallback", "error", err)
+			slog.Warn("UTXO rebuild failed", "error", err)
 			utxoSet = utxo.NewSet()
 		} else {
-			// Sync balances from UTXO set.
 			l.Balances = utxoSet.AllBalances()
 		}
 		l.UTXOSet = utxoSet
@@ -1082,16 +1388,14 @@ func LoadLedger(filePath string) *Ledger {
 		l.UTXOSet = utxo.NewSet()
 	}
 
-	// Initialize mempool (transient, not persisted).
 	l.Mempool = mempool.New(mempool.DefaultMaxSize)
 
-	// Rebuild block index (CRITICAL-4).
 	if l.Chain != nil && l.Chain.Index == nil {
 		l.Chain.Index = chain.NewBlockIndex()
 		l.Chain.Index.BuildFromBlocks(l.Chain.Blocks)
 	}
 
-	slog.Info("Ledger loaded",
+	slog.Info("Ledger loaded (legacy fallback)",
 		"blocks", l.Chain.Len(),
 		"path", filePath,
 		"utxo_count", l.UTXOSet.Size(),
@@ -1100,84 +1404,20 @@ func LoadLedger(filePath string) *Ledger {
 	return &l
 }
 
-// LoadLedgerWithOwner reads a ledger from a JSON file with a specific genesis owner.
-// If no file exists, creates a new chain with the given owner.
-func LoadLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		slog.Info("No data file found, starting fresh with configured genesis owner",
-			"path", filePath,
-			"genesis_owner", genesisOwner,
-		)
-		return NewLedgerWithOwner(filePath, genesisOwner)
+// newLedgerWithOwnerNoStore creates a new ledger without the storage engine.
+func newLedgerWithOwnerNoStore(filePath string, genesisOwner string) *Ledger {
+	bc := chain.NewBlockchainWithOwner(genesisOwner)
+	utxoSet, _ := utxo.RebuildFromBlocks(bc.Blocks)
+	if utxoSet == nil {
+		utxoSet = utxo.NewSet()
 	}
-
-	// File exists — load normally (genesis owner validated later via SetFaucetKeyAndValidateGenesis).
-	var l Ledger
-	if err := json.Unmarshal(data, &l); err != nil {
-		slog.Warn("Failed to parse data file, starting fresh", "path", filePath, "error", err)
-		return NewLedgerWithOwner(filePath, genesisOwner)
+	return &Ledger{
+		Chain:    bc,
+		Balances: utxoSet.AllBalances(),
+		filePath: filePath,
+		UTXOSet:  utxoSet,
+		Mempool:  mempool.New(mempool.DefaultMaxSize),
 	}
-	l.filePath = filePath
-	if l.Balances == nil {
-		l.Balances = make(map[string]float64)
-	}
-
-	// Rebuild chain target from hex if needed.
-	if l.Chain != nil && l.Chain.Target == nil {
-		if l.Chain.TargetHex != "" {
-			l.Chain.Target = block.TargetFromBits(l.Chain.TargetHex)
-		} else {
-			l.Chain.Target = block.InitialTarget
-		}
-	}
-
-	// Back-fill GenesisOwner from genesis block if metadata is missing (legacy data).
-	if l.Chain != nil && l.Chain.GenesisOwner == "" && len(l.Chain.Blocks) > 0 {
-		if owner, ok := block.GenesisOwnerFromBlock(l.Chain.Blocks[0]); ok {
-			l.Chain.GenesisOwner = owner
-			slog.Info("Back-filled genesis owner from genesis block", "genesis_owner", owner)
-		}
-	}
-
-	// Check for legacy chain data.
-	if l.Chain != nil {
-		if hasLegacy, height := chain.ContainsLegacyBlocks(l.Chain); hasLegacy {
-			slog.Error("FATAL: chain data contains legacy account-model transactions",
-				"block_height", height)
-			return NewLedgerWithOwner(filePath, genesisOwner)
-		}
-	}
-
-	// Rebuild UTXO set from the loaded chain.
-	if l.Chain != nil {
-		utxoSet, err := utxo.RebuildFromBlocks(l.Chain.Blocks)
-		if err != nil {
-			slog.Warn("UTXO rebuild failed, using balance map fallback", "error", err)
-			utxoSet = utxo.NewSet()
-		} else {
-			l.Balances = utxoSet.AllBalances()
-		}
-		l.UTXOSet = utxoSet
-	} else {
-		l.UTXOSet = utxo.NewSet()
-	}
-
-	l.Mempool = mempool.New(mempool.DefaultMaxSize)
-
-	// Rebuild block index (CRITICAL-4).
-	if l.Chain != nil && l.Chain.Index == nil {
-		l.Chain.Index = chain.NewBlockIndex()
-		l.Chain.Index.BuildFromBlocks(l.Chain.Blocks)
-	}
-
-	slog.Info("Ledger loaded",
-		"blocks", l.Chain.Len(),
-		"path", filePath,
-		"utxo_count", l.UTXOSet.Size(),
-		"genesis_owner", l.GenesisOwner(),
-	)
-	return &l
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@
 //
 //	PORT               — HTTP port to listen on              (default: 3000)
 //	P2P_PORT           — TCP P2P port to listen on           (default: 9333)
-//	DATA_FILE          — path to the JSON storage file       (default: node_data.json)
+//	DATA_FILE          — path to storage (legacy JSON or directory)  (default: node_data.json)
 //	FAUCET_KEY         — hex-encoded Ed25519 private key     (optional)
 //	PEERS              — comma-separated list of HTTP peer URLs  (optional)
 //	TCP_PEERS          — comma-separated list of TCP peer addresses (host:port) (optional)
