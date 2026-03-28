@@ -157,7 +157,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"node":    "noda",
-		"version": "0.7.0",
+		"version": "0.8.0",
 	})
 }
 
@@ -326,10 +326,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
 		"port":                  s.Port,
-		"version":               "0.7.0",
+		"version":               "0.8.0",
 		"tx_model":              "utxo_inputs_outputs",
+		"chain_selection":       "cumulative_work",
 		"block_height":          ch.Height(),
 		"chain_length":          ch.Len(),
+		"cumulative_work":       ch.CumulativeWork().String(),
 		"peers":                 len(s.Network.GetPeers()),
 		"http_peers":            len(s.Network.GetPeers()),
 		"total_mined":           ch.TotalMined,
@@ -343,6 +345,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"genesis_owner":         s.Ledger.GenesisOwner(),
 		"faucet_owner_match":    s.Ledger.FaucetOwnerMatch(),
 		"usable_faucet_balance": s.Ledger.UsableFaucetBalance(),
+	}
+
+	// Block index info (CRITICAL-4).
+	if idx := s.Ledger.GetBlockIndex(); idx != nil {
+		resp["orphan_count"] = idx.OrphanCount()
 	}
 
 	// Mining info (CRITICAL-3).

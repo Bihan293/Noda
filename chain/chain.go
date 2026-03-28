@@ -1,6 +1,10 @@
 // Package chain manages the blockchain — an ordered sequence of blocks.
 // It provides methods to add blocks, query state, and serialize/deserialize
 // the chain for persistence and P2P synchronization.
+//
+// CRITICAL-4: Best chain selection is based on cumulative work (sum of work
+// from genesis to tip), not chain length. The BlockIndex tracks metadata for
+// every known block and supports reorg and orphan management.
 package chain
 
 import (
@@ -21,7 +25,11 @@ type Blockchain struct {
 	GenesisOwner string         `json:"genesis_owner"` // address that owns the genesis supply
 	Target       *big.Int       `json:"-"`              // current difficulty target (not serialized directly)
 	TargetHex    string         `json:"target_hex"`     // hex-serialized target for JSON persistence
-	mu           sync.RWMutex
+
+	// CRITICAL-4: Block index and cumulative work.
+	Index *BlockIndex `json:"-"` // block index (not serialized — rebuilt from blocks)
+
+	mu sync.RWMutex
 }
 
 // NewBlockchain creates a new blockchain with the genesis block using the legacy address.
@@ -38,6 +46,7 @@ func NewBlockchainWithOwner(genesisOwner string) *Blockchain {
 		GenesisOwner: genesisOwner,
 		Target:       new(big.Int).Set(block.InitialTarget),
 		TargetHex:    block.BitsFromTarget(block.InitialTarget),
+		Index:        NewBlockIndex(),
 	}
 	bc.addGenesis(genesisOwner)
 	return bc
@@ -47,6 +56,10 @@ func NewBlockchainWithOwner(genesisOwner string) *Blockchain {
 func (bc *Blockchain) addGenesis(ownerAddress string) {
 	genesis := block.NewGenesisBlockWithOwner(ownerAddress)
 	bc.Blocks = append(bc.Blocks, genesis)
+	// Add genesis to block index.
+	if bc.Index != nil {
+		bc.Index.AddBlock(genesis)
+	}
 	slog.Info("Genesis block created", "hash", genesis.Hash[:16], "genesis_owner", ownerAddress)
 }
 
@@ -108,6 +121,11 @@ func (bc *Blockchain) AddBlock(b *block.Block) error {
 	}
 
 	bc.Blocks = append(bc.Blocks, b)
+
+	// Add to block index (CRITICAL-4).
+	if bc.Index != nil {
+		bc.Index.AddBlock(b)
+	}
 
 	// Adjust difficulty if needed.
 	if expectedHeight > 0 && expectedHeight%block.DifficultyAdjustmentInterval == 0 {
@@ -195,7 +213,67 @@ func FromJSON(data []byte) (*Blockchain, error) {
 		bc.TargetHex = block.BitsFromTarget(block.InitialTarget)
 	}
 
+	// Rebuild block index from loaded blocks.
+	bc.Index = NewBlockIndex()
+	bc.Index.BuildFromBlocks(bc.Blocks)
+
 	return &bc, nil
+}
+
+// CumulativeWork returns the cumulative work of the best chain tip.
+// CRITICAL-4: This is the correct metric for chain comparison.
+func (bc *Blockchain) CumulativeWork() *big.Int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if bc.Index != nil {
+		return bc.Index.BestCumulativeWork()
+	}
+	// Fallback: compute from blocks.
+	total := new(big.Int)
+	for _, b := range bc.Blocks {
+		total.Add(total, block.WorkForBits(b.Header.Bits))
+	}
+	return total
+}
+
+// GetBlockByHash returns the block with the given hash, or nil if not found.
+func (bc *Blockchain) GetBlockByHash(hash string) *block.Block {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	if bc.Index != nil {
+		node := bc.Index.GetNode(hash)
+		if node != nil && node.Block != nil {
+			return node.Block
+		}
+	}
+	// Fallback linear scan.
+	for _, b := range bc.Blocks {
+		if b.Hash == hash {
+			return b
+		}
+	}
+	return nil
+}
+
+// RebuildIndex rebuilds the block index from the current block list.
+func (bc *Blockchain) RebuildIndex() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.Index = NewBlockIndex()
+	bc.Index.BuildFromBlocks(bc.Blocks)
+}
+
+// RecalcTotalMined recomputes TotalMined from all blocks (used after reorg).
+func (bc *Blockchain) RecalcTotalMined() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	var total float64
+	for _, b := range bc.Blocks {
+		if b.Header.Height > 0 && len(b.Transactions) > 0 && b.Transactions[0].IsCoinbase() {
+			total += b.Transactions[0].TotalOutputValue()
+		}
+	}
+	bc.TotalMined = total
 }
 
 // ValidateChain checks the full integrity of a blockchain from genesis to tip.

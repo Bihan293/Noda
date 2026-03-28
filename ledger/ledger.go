@@ -671,16 +671,24 @@ func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Chain Sync
+// Chain Sync — CRITICAL-4: selection by cumulative work, not length
 // ──────────────────────────────────────────────────────────────────────────────
 
-// ReplaceChain replaces the current chain if the new one is longer and valid.
+// ReplaceChain replaces the current chain if the new one has MORE CUMULATIVE
+// WORK and is valid. CRITICAL-4: no longer compares by length.
 // Rebuilds the UTXO set from the new chain.
 func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if newChain.Len() <= l.Chain.Len() {
+	// CRITICAL-4: Compare by cumulative work, not length.
+	newWork := newChain.CumulativeWork()
+	oldWork := l.Chain.CumulativeWork()
+	if newWork.Cmp(oldWork) <= 0 {
+		slog.Debug("Sync rejected: new chain does not have more cumulative work",
+			"old_work", oldWork.String(),
+			"new_work", newWork.String(),
+		)
 		return false
 	}
 
@@ -707,16 +715,286 @@ func (l *Ledger) ReplaceChain(newChain *chain.Blockchain) bool {
 	// Rebuild balances from UTXO.
 	balances := newUTXO.AllBalances()
 
+	// Collect transactions from old chain blocks that are NOT in new chain
+	// and return them to the mempool if still valid.
+	oldBlocks := make(map[string]bool)
+	for _, b := range l.Chain.Blocks {
+		oldBlocks[b.Hash] = true
+	}
+	newBlocks := make(map[string]bool)
+	for _, b := range newChain.Blocks {
+		newBlocks[b.Hash] = true
+	}
+	var returnToMempool []block.Transaction
+	for _, b := range l.Chain.Blocks {
+		if !newBlocks[b.Hash] && b.Header.Height > 0 {
+			for _, tx := range b.Transactions {
+				if !tx.IsCoinbase() && !tx.IsGenesis() {
+					returnToMempool = append(returnToMempool, tx)
+				}
+			}
+		}
+	}
+
 	l.Chain = newChain
 	l.UTXOSet = newUTXO
 	l.Balances = balances
+
+	// Rebuild index.
+	l.Chain.RebuildIndex()
+
 	_ = l.saveLocked()
 
-	slog.Info("Chain replaced",
+	slog.Info("Chain replaced (cumulative work)",
 		"blocks", newChain.Len(),
 		"utxo_count", newUTXO.Size(),
+		"cumulative_work", newWork.String(),
+		"returned_to_mempool", len(returnToMempool),
 	)
+
+	// Try to return disconnected transactions to mempool.
+	for _, tx := range returnToMempool {
+		if tx.ID == "" {
+			tx.ID = block.HashTransaction(&tx)
+		}
+		// Best effort — ignore errors (tx may be invalid against new UTXO state).
+		_ = l.Mempool.Add(tx)
+	}
+
 	return true
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Block Processing — CRITICAL-4: Process individual blocks with reorg support
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ProcessBlock validates a block and integrates it into the chain. If the block
+// causes a chain reorg (a side branch accumulating more work than the main chain),
+// the UTXO set is rolled back to the fork point and reapplied on the new best chain.
+//
+// Returns true if the block was accepted (main chain or orphan), false if rejected.
+func (l *Ledger) ProcessBlock(b *block.Block) (accepted bool, isOrphan bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	idx := l.Chain.Index
+	if idx == nil {
+		return false, false, fmt.Errorf("block index not initialized")
+	}
+
+	// Check for duplicate.
+	if idx.HasBlock(b.Hash) || idx.HasOrphan(b.Hash) {
+		return false, false, nil // duplicate
+	}
+
+	// Basic block validation (header, merkle, PoW) — but not chain linkage
+	// because the block may be on a side branch.
+	if b.Header.Height > 0 {
+		computed := block.HashBlockHeader(b.Header)
+		if b.Hash != computed {
+			return false, false, fmt.Errorf("hash mismatch at height %d", b.Header.Height)
+		}
+		target := block.TargetFromBits(b.Header.Bits)
+		if !block.MeetsTarget(b.Hash, target) {
+			return false, false, fmt.Errorf("PoW not satisfied at height %d", b.Header.Height)
+		}
+		if err := block.ValidateBlockMerkle(b); err != nil {
+			return false, false, err
+		}
+	}
+
+	// Add to block index — this handles orphan detection and best-tip comparison.
+	result := idx.AddBlock(b)
+	if !result.Added {
+		return false, false, nil // duplicate
+	}
+
+	if result.IsOrphan {
+		slog.Debug("Block added to orphan pool",
+			"hash", b.Hash[:16],
+			"height", b.Header.Height,
+		)
+		return true, true, nil
+	}
+
+	// Block has a known parent. Determine if it extends the main chain or causes reorg.
+	if result.ReorgOccurred {
+		// A side chain now has more cumulative work — perform reorg.
+		slog.Info("Performing chain reorganization",
+			"old_tip", result.OldTip[:16],
+			"new_tip", result.NewTip[:16],
+		)
+		if err := l.performReorgLocked(result.OldTip, result.NewTip); err != nil {
+			slog.Error("Reorg failed — keeping old chain", "error", err)
+			// TODO: roll back index state on failure
+			return false, false, fmt.Errorf("reorg failed: %w", err)
+		}
+	} else {
+		// Extends the current main chain — simple append.
+		if b.Header.PrevBlockHash == l.Chain.LastHash() {
+			// Snapshot inputs before applying.
+			snap := l.UTXOSet.SnapshotInputs(b)
+			_ = snap // stored for potential future rollback
+
+			if errApply := l.UTXOSet.ApplyBlock(b); errApply != nil {
+				return false, false, fmt.Errorf("UTXO apply failed: %w", errApply)
+			}
+
+			// Track mined coins.
+			if len(b.Transactions) > 0 && b.Transactions[0].IsCoinbase() && b.Header.Height > 0 {
+				l.Chain.TotalMined += b.Transactions[0].TotalOutputValue()
+			}
+
+			l.Chain.Blocks = append(l.Chain.Blocks, b)
+
+			// Remove confirmed transactions from mempool.
+			for _, tx := range b.Transactions {
+				l.Mempool.Remove(tx.ID)
+			}
+
+			l.Balances = l.UTXOSet.AllBalances()
+			_ = l.saveLocked()
+
+			slog.Debug("Block added to main chain",
+				"height", b.Header.Height,
+				"hash", b.Hash[:16],
+			)
+		}
+		// If not extending main chain tip, it's a side-chain block — already indexed.
+	}
+
+	// Process any orphans that were waiting for this block.
+	for _, orphan := range result.ConnectedOrphans {
+		slog.Debug("Processing connected orphan",
+			"hash", orphan.Hash[:16],
+			"height", orphan.Header.Height,
+		)
+		// Recursive call without holding lock (already held).
+		// We need to process these through the index again.
+		orphanResult := idx.AddBlock(orphan)
+		if orphanResult.Added && !orphanResult.IsOrphan {
+			if orphanResult.ReorgOccurred {
+				if err := l.performReorgLocked(orphanResult.OldTip, orphanResult.NewTip); err != nil {
+					slog.Error("Orphan reorg failed", "error", err)
+				}
+			} else if orphan.Header.PrevBlockHash == l.Chain.LastHash() {
+				if errApply := l.UTXOSet.ApplyBlock(orphan); errApply == nil {
+					if len(orphan.Transactions) > 0 && orphan.Transactions[0].IsCoinbase() && orphan.Header.Height > 0 {
+						l.Chain.TotalMined += orphan.Transactions[0].TotalOutputValue()
+					}
+					l.Chain.Blocks = append(l.Chain.Blocks, orphan)
+					for _, tx := range orphan.Transactions {
+						l.Mempool.Remove(tx.ID)
+					}
+					l.Balances = l.UTXOSet.AllBalances()
+					_ = l.saveLocked()
+				}
+			}
+		}
+	}
+
+	return true, false, nil
+}
+
+// performReorgLocked performs a chain reorganization. Must hold l.mu.
+// It finds the fork point between the old and new best chain tips,
+// rolls back the UTXO set to the fork point, and applies the new chain.
+func (l *Ledger) performReorgLocked(oldTipHash, newTipHash string) error {
+	idx := l.Chain.Index
+	forkPoint, disconnect, connect, err := idx.FindForkPoint(oldTipHash, newTipHash)
+	if err != nil {
+		return fmt.Errorf("find fork point: %w", err)
+	}
+
+	slog.Info("Reorg details",
+		"fork_point", forkPoint.Hash[:16],
+		"fork_height", forkPoint.Height,
+		"disconnect", len(disconnect),
+		"connect", len(connect),
+	)
+
+	// Rebuild UTXO from genesis up to (and including) the fork point.
+	// This is the safest approach — rebuild from scratch up to fork.
+	var blocksToFork []*block.Block
+	current := forkPoint
+	var path []*chain.BlockNode
+	for current != nil {
+		path = append(path, current)
+		parent := idx.GetNode(current.ParentHash)
+		if parent == nil {
+			break
+		}
+		current = parent
+	}
+	// Reverse to get genesis-first order.
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i].Block != nil {
+			blocksToFork = append(blocksToFork, path[i].Block)
+		}
+	}
+
+	newUTXO, err := utxo.RebuildFromBlocks(blocksToFork)
+	if err != nil {
+		return fmt.Errorf("UTXO rebuild to fork point failed: %w", err)
+	}
+
+	// Collect transactions from disconnected blocks to potentially return to mempool.
+	var returnToMempool []block.Transaction
+	for _, node := range disconnect {
+		if node.Block != nil {
+			for _, tx := range node.Block.Transactions {
+				if !tx.IsCoinbase() && !tx.IsGenesis() {
+					returnToMempool = append(returnToMempool, tx)
+				}
+			}
+		}
+	}
+
+	// Apply the new branch blocks (connect) to the UTXO set.
+	var newBlocks []*block.Block
+	newBlocks = append(newBlocks, blocksToFork...)
+	for _, node := range connect {
+		if node.Block == nil {
+			return fmt.Errorf("missing block data for %s", node.Hash[:16])
+		}
+		if err := newUTXO.ApplyBlock(node.Block); err != nil {
+			return fmt.Errorf("apply connect block %d: %w", node.Height, err)
+		}
+		newBlocks = append(newBlocks, node.Block)
+	}
+
+	// Update chain state.
+	l.Chain.Blocks = newBlocks
+	l.UTXOSet = newUTXO
+	l.Balances = newUTXO.AllBalances()
+	l.Chain.RecalcTotalMined()
+	idx.UpdateMainChainStatus()
+
+	_ = l.saveLocked()
+
+	slog.Info("Reorg completed",
+		"new_height", l.Chain.Height(),
+		"disconnected", len(disconnect),
+		"connected", len(connect),
+		"utxo_count", newUTXO.Size(),
+	)
+
+	// Return disconnected transactions to mempool (best effort).
+	for _, tx := range returnToMempool {
+		if tx.ID == "" {
+			tx.ID = block.HashTransaction(&tx)
+		}
+		_ = l.Mempool.Add(tx)
+	}
+
+	return nil
+}
+
+// GetBlockIndex returns the chain's block index.
+func (l *Ledger) GetBlockIndex() *chain.BlockIndex {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.Chain.Index
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -807,6 +1085,12 @@ func LoadLedger(filePath string) *Ledger {
 	// Initialize mempool (transient, not persisted).
 	l.Mempool = mempool.New(mempool.DefaultMaxSize)
 
+	// Rebuild block index (CRITICAL-4).
+	if l.Chain != nil && l.Chain.Index == nil {
+		l.Chain.Index = chain.NewBlockIndex()
+		l.Chain.Index.BuildFromBlocks(l.Chain.Blocks)
+	}
+
 	slog.Info("Ledger loaded",
 		"blocks", l.Chain.Len(),
 		"path", filePath,
@@ -880,6 +1164,12 @@ func LoadLedgerWithOwner(filePath string, genesisOwner string) *Ledger {
 	}
 
 	l.Mempool = mempool.New(mempool.DefaultMaxSize)
+
+	// Rebuild block index (CRITICAL-4).
+	if l.Chain != nil && l.Chain.Index == nil {
+		l.Chain.Index = chain.NewBlockIndex()
+		l.Chain.Index.BuildFromBlocks(l.Chain.Blocks)
+	}
 
 	slog.Info("Ledger loaded",
 		"blocks", l.Chain.Len(),

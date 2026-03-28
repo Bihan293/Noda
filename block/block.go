@@ -451,6 +451,38 @@ func AdjustDifficulty(currentTarget *big.Int, actualTimeSpan int64) *big.Int {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Cumulative Work (CRITICAL-4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// MaxTargetBig is 2^256 — used for work calculation.
+var MaxTargetBig *big.Int
+
+func init() {
+	MaxTargetBig = new(big.Int).Lsh(big.NewInt(1), 256)
+}
+
+// WorkForTarget returns the amount of expected hashes to find a hash ≤ target.
+// work = 2^256 / (target + 1). Returns at least 1 for any valid target.
+// This is the standard Bitcoin-style work calculation.
+func WorkForTarget(target *big.Int) *big.Int {
+	if target.Sign() <= 0 {
+		return big.NewInt(1)
+	}
+	// work = 2^256 / (target + 1)
+	denom := new(big.Int).Add(target, big.NewInt(1))
+	work := new(big.Int).Div(MaxTargetBig, denom)
+	if work.Sign() <= 0 {
+		return big.NewInt(1)
+	}
+	return work
+}
+
+// WorkForBits computes the work for a target given as a hex bits string.
+func WorkForBits(bits string) *big.Int {
+	return WorkForTarget(TargetFromBits(bits))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Coinbase Transaction
 // ──────────────────────────────────────────────────────────────────────────────
 

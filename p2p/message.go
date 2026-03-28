@@ -52,16 +52,18 @@ const (
 // ──────────────────────────────────────────────────────────────────────────────
 
 const (
-	CmdVersion   = "version"
-	CmdVerack    = "verack"
-	CmdPing      = "ping"
-	CmdPong      = "pong"
-	CmdInv       = "inv"
-	CmdGetData   = "getdata"
-	CmdTx        = "tx"
-	CmdBlock     = "block"
-	CmdGetBlocks = "getblocks"
-	CmdAddr      = "addr"
+	CmdVersion    = "version"
+	CmdVerack     = "verack"
+	CmdPing       = "ping"
+	CmdPong       = "pong"
+	CmdInv        = "inv"
+	CmdGetData    = "getdata"
+	CmdTx         = "tx"
+	CmdBlock      = "block"
+	CmdGetBlocks  = "getblocks"
+	CmdAddr       = "addr"
+	CmdGetHeaders = "getheaders"  // CRITICAL-4: headers-first sync
+	CmdHeaders    = "headers"     // CRITICAL-4: headers-first sync
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -130,6 +132,30 @@ type PeerAddress struct {
 	Port      uint16 `json:"port"`
 	Timestamp int64  `json:"timestamp"` // last known active time
 	NodeID    string `json:"node_id"`
+}
+
+// GetHeadersPayload requests block headers starting from a known hash.
+// CRITICAL-4: headers-first sync support.
+type GetHeadersPayload struct {
+	FromHash string `json:"from_hash"` // hash of the last known block
+	Limit    int    `json:"limit"`     // max number of headers to return
+}
+
+// BlockHeaderInfo contains block header metadata for headers-first sync.
+type BlockHeaderInfo struct {
+	Hash       string `json:"hash"`
+	Height     uint64 `json:"height"`
+	PrevHash   string `json:"prev_hash"`
+	MerkleRoot string `json:"merkle_root"`
+	Timestamp  int64  `json:"timestamp"`
+	Bits       string `json:"bits"`
+	Nonce      uint64 `json:"nonce"`
+	TxCount    int    `json:"tx_count"`
+}
+
+// HeadersPayload carries block headers for headers-first sync.
+type HeadersPayload struct {
+	Headers []BlockHeaderInfo `json:"headers"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
