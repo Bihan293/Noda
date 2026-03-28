@@ -730,5 +730,452 @@ done:
 	}
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: Cumulative work chain selection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestCumulativeWorkChainSelection(t *testing.T) {
+	// Create two chains from the same genesis.
+	// Chain A: 3 blocks with easy target (low work).
+	// Chain B: 2 blocks with harder target (more total work).
+	// The shorter chain B should win because it has more cumulative work.
+
+	// Easy target (very easy to mine — low work per block).
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Harder target (more work per block).
+	hardTarget := new(big.Int)
+	hardTarget.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Build Chain A: genesis + 3 blocks with easy target.
+	bcA := chain.NewBlockchain()
+	for i := uint64(1); i <= 3; i++ {
+		tx := block.NewCoinbaseTx("minerA", 50, i)
+		merkle := block.ComputeMerkleRoot([]string{tx.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version:       block.BlockVersion,
+				Height:        i,
+				PrevBlockHash: bcA.LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     bcA.LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{tx},
+		}
+		if err := block.MineBlock(b, easyTarget, 10_000_000); err != nil {
+			t.Fatalf("Chain A MineBlock(%d) error: %v", i, err)
+		}
+		if err := bcA.AddBlock(b); err != nil {
+			t.Fatalf("Chain A AddBlock(%d) error: %v", i, err)
+		}
+	}
+
+	// Build Chain B: genesis + 2 blocks with harder target.
+	bcB := chain.NewBlockchain()
+	for i := uint64(1); i <= 2; i++ {
+		tx := block.NewCoinbaseTx("minerB", 50, i)
+		merkle := block.ComputeMerkleRoot([]string{tx.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version:       block.BlockVersion,
+				Height:        i,
+				PrevBlockHash: bcB.LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     bcB.LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{tx},
+		}
+		if err := block.MineBlock(b, hardTarget, 100_000_000); err != nil {
+			t.Fatalf("Chain B MineBlock(%d) error: %v", i, err)
+		}
+		if err := bcB.AddBlock(b); err != nil {
+			t.Fatalf("Chain B AddBlock(%d) error: %v", i, err)
+		}
+	}
+
+	// Chain A is LONGER (3 blocks post-genesis) but has LESS cumulative work.
+	// Chain B is SHORTER (2 blocks post-genesis) but has MORE cumulative work.
+	if bcA.Len() <= bcB.Len() {
+		t.Fatalf("Chain A should be longer: A=%d B=%d", bcA.Len(), bcB.Len())
+	}
+
+	workA := bcA.CumulativeWork()
+	workB := bcB.CumulativeWork()
+	if workB.Cmp(workA) <= 0 {
+		t.Fatalf("Chain B should have more work: A=%s B=%s", workA.String(), workB.String())
+	}
+
+	// Create a ledger with chain A.
+	l := ledger.NewLedger(tmpFile(t))
+	// Manually build chain A into the ledger.
+	for i := 1; i < bcA.Len(); i++ {
+		b := bcA.GetBlock(uint64(i))
+		l.GetChain().AddBlock(b)
+		l.UTXOSet.ApplyBlock(b)
+	}
+
+	// Now try to replace with chain B (shorter but more work).
+	replaced := l.ReplaceChain(bcB)
+	if !replaced {
+		t.Error("ReplaceChain should accept chain B (more cumulative work)")
+	}
+	if l.GetChainHeight() != bcB.Height() {
+		t.Errorf("height after replace = %d, want %d", l.GetChainHeight(), bcB.Height())
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: Reorg rolls back UTXO correctly
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestReorgRollsBackUTXO(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// Send coins and mine them.
+	recvKP, _ := crypto.GenerateKeyPair()
+	tx, err := l.BuildTransaction(privHex, kp.Address, recvKP.Address, 100)
+	if err != nil {
+		t.Fatalf("BuildTransaction() error: %v", err)
+	}
+	if err := l.SubmitTransaction(*tx); err != nil {
+		t.Fatalf("SubmitTransaction() error: %v", err)
+	}
+
+	// Mine the block.
+	cfg := miner.Config{
+		Enabled:      true,
+		MinerAddress: minerKP.Address,
+		BlockMaxTx:   100,
+		Interval:     50 * time.Millisecond,
+		MaxAttempts:  10_000_000,
+	}
+	m := miner.New(cfg, l)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go m.Run(ctx)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("miner did not process transactions within timeout")
+		default:
+			if l.GetMempoolSize() == 0 {
+				goto mined
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+mined:
+	cancel()
+
+	// Verify the receiver got coins.
+	if l.GetBalance(recvKP.Address) != 100 {
+		t.Errorf("receiver balance = %f, want 100", l.GetBalance(recvKP.Address))
+	}
+
+	// Record the state before replacing.
+	heightBefore := l.GetChainHeight()
+	if heightBefore < 1 {
+		t.Fatal("chain should have height >= 1 after mining")
+	}
+
+	// Now create an alternative chain without the transfer (just coinbase).
+	// It needs more cumulative work.
+	altBC := chain.NewBlockchainWithOwner(kp.Address)
+	hardTarget := new(big.Int)
+	hardTarget.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	for i := uint64(1); i <= heightBefore+1; i++ {
+		altTx := block.NewCoinbaseTx(minerKP.Address, 50, i)
+		merkle := block.ComputeMerkleRoot([]string{altTx.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version:       block.BlockVersion,
+				Height:        i,
+				PrevBlockHash: altBC.LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     altBC.LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{altTx},
+		}
+		if err := block.MineBlock(b, hardTarget, 100_000_000); err != nil {
+			t.Fatalf("Alt chain MineBlock(%d) error: %v", i, err)
+		}
+		if err := altBC.AddBlock(b); err != nil {
+			t.Fatalf("Alt chain AddBlock(%d) error: %v", i, err)
+		}
+	}
+
+	// Replace with the alternative chain.
+	replaced := l.ReplaceChain(altBC)
+	if !replaced {
+		t.Fatal("ReplaceChain should accept alternative chain with more work")
+	}
+
+	// After reorg, receiver should have 0 balance (the tx was on the old chain).
+	if l.GetBalance(recvKP.Address) != 0 {
+		t.Errorf("receiver balance after reorg = %f, want 0", l.GetBalance(recvKP.Address))
+	}
+
+	// Genesis owner should have the full genesis supply again.
+	if l.GetBalance(kp.Address) != block.GenesisSupply {
+		t.Errorf("genesis owner balance after reorg = %f, want %f", l.GetBalance(kp.Address), block.GenesisSupply)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: Orphan block connects after parent arrives
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestOrphanBlockConnectsAfterParent(t *testing.T) {
+	idx := chain.NewBlockIndex()
+
+	// Build a chain: genesis -> block1 -> block2
+	genesis := block.NewGenesisBlock()
+	idx.AddBlock(genesis)
+
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Block 1
+	tx1 := block.NewCoinbaseTx("miner", 50, 1)
+	merkle1 := block.ComputeMerkleRoot([]string{tx1.ID})
+	b1 := &block.Block{
+		Header: block.BlockHeader{
+			Version:       block.BlockVersion,
+			Height:        1,
+			PrevBlockHash: genesis.Hash,
+			MerkleRoot:    merkle1,
+			Timestamp:     genesis.Header.Timestamp + 600,
+		},
+		Transactions: []block.Transaction{tx1},
+	}
+	block.MineBlock(b1, easyTarget, 1000)
+
+	// Block 2 (depends on block 1).
+	tx2 := block.NewCoinbaseTx("miner", 50, 2)
+	merkle2 := block.ComputeMerkleRoot([]string{tx2.ID})
+	b2 := &block.Block{
+		Header: block.BlockHeader{
+			Version:       block.BlockVersion,
+			Height:        2,
+			PrevBlockHash: b1.Hash,
+			MerkleRoot:    merkle2,
+			Timestamp:     b1.Header.Timestamp + 600,
+		},
+		Transactions: []block.Transaction{tx2},
+	}
+	block.MineBlock(b2, easyTarget, 1000)
+
+	// Submit block 2 first (orphan — parent b1 not yet known).
+	result2 := idx.AddBlock(b2)
+	if !result2.Added {
+		t.Fatal("block 2 should be added")
+	}
+	if !result2.IsOrphan {
+		t.Fatal("block 2 should be an orphan (parent not known)")
+	}
+	if idx.OrphanCount() != 1 {
+		t.Errorf("orphan count = %d, want 1", idx.OrphanCount())
+	}
+
+	// Now submit block 1 (parent of orphan block 2).
+	result1 := idx.AddBlock(b1)
+	if !result1.Added {
+		t.Fatal("block 1 should be added")
+	}
+	if result1.IsOrphan {
+		t.Fatal("block 1 should NOT be an orphan (parent is genesis)")
+	}
+
+	// Block 2 should have been connected as an orphan.
+	if len(result1.ConnectedOrphans) != 1 {
+		t.Errorf("connected orphans = %d, want 1", len(result1.ConnectedOrphans))
+	}
+	if idx.OrphanCount() != 0 {
+		t.Errorf("orphan count after connect = %d, want 0", idx.OrphanCount())
+	}
+
+	// Best tip should be block 2.
+	bestTip := idx.BestTip()
+	if bestTip == nil {
+		t.Fatal("best tip should not be nil")
+	}
+	if bestTip.Hash != b2.Hash {
+		t.Errorf("best tip = %s, want block 2 hash", bestTip.Hash[:16])
+	}
+	if bestTip.Height != 2 {
+		t.Errorf("best tip height = %d, want 2", bestTip.Height)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: Block index fork point detection
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBlockIndexForkPoint(t *testing.T) {
+	idx := chain.NewBlockIndex()
+
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Genesis
+	genesis := block.NewGenesisBlock()
+	idx.AddBlock(genesis)
+
+	// Main chain: genesis -> b1 -> b2
+	tx1 := block.NewCoinbaseTx("minerA", 50, 1)
+	b1 := &block.Block{
+		Header: block.BlockHeader{
+			Version: block.BlockVersion, Height: 1,
+			PrevBlockHash: genesis.Hash,
+			MerkleRoot:    block.ComputeMerkleRoot([]string{tx1.ID}),
+			Timestamp:     genesis.Header.Timestamp + 600,
+		},
+		Transactions: []block.Transaction{tx1},
+	}
+	block.MineBlock(b1, easyTarget, 1000)
+	idx.AddBlock(b1)
+
+	tx2 := block.NewCoinbaseTx("minerA", 50, 2)
+	b2 := &block.Block{
+		Header: block.BlockHeader{
+			Version: block.BlockVersion, Height: 2,
+			PrevBlockHash: b1.Hash,
+			MerkleRoot:    block.ComputeMerkleRoot([]string{tx2.ID}),
+			Timestamp:     b1.Header.Timestamp + 600,
+		},
+		Transactions: []block.Transaction{tx2},
+	}
+	block.MineBlock(b2, easyTarget, 1000)
+	idx.AddBlock(b2)
+
+	// Fork: genesis -> b1 -> b2alt
+	tx2alt := block.NewCoinbaseTx("minerB", 50, 2)
+	b2alt := &block.Block{
+		Header: block.BlockHeader{
+			Version: block.BlockVersion, Height: 2,
+			PrevBlockHash: b1.Hash,
+			MerkleRoot:    block.ComputeMerkleRoot([]string{tx2alt.ID}),
+			Timestamp:     b1.Header.Timestamp + 601, // slightly different timestamp
+		},
+		Transactions: []block.Transaction{tx2alt},
+	}
+	block.MineBlock(b2alt, easyTarget, 1000)
+	idx.AddBlock(b2alt)
+
+	// Find fork point between b2 and b2alt.
+	forkPoint, disconnect, connect, err := idx.FindForkPoint(b2.Hash, b2alt.Hash)
+	if err != nil {
+		t.Fatalf("FindForkPoint() error: %v", err)
+	}
+
+	if forkPoint == nil {
+		t.Fatal("fork point should not be nil")
+	}
+	if forkPoint.Hash != b1.Hash {
+		t.Errorf("fork point = %s, want b1 hash", forkPoint.Hash[:16])
+	}
+	if len(disconnect) != 1 {
+		t.Errorf("disconnect count = %d, want 1", len(disconnect))
+	}
+	if len(connect) != 1 {
+		t.Errorf("connect count = %d, want 1", len(connect))
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: WorkForTarget calculation
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestWorkForTarget(t *testing.T) {
+	// Harder target (smaller number) should produce more work.
+	hardTarget := new(big.Int)
+	hardTarget.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	hardWork := block.WorkForTarget(hardTarget)
+	easyWork := block.WorkForTarget(easyTarget)
+
+	if hardWork.Cmp(easyWork) <= 0 {
+		t.Errorf("hard target work (%s) should be > easy target work (%s)",
+			hardWork.String(), easyWork.String())
+	}
+
+	// Zero target should give work = 1 (not panic).
+	zeroWork := block.WorkForTarget(big.NewInt(0))
+	if zeroWork.Cmp(big.NewInt(1)) < 0 {
+		t.Errorf("zero target work = %s, want >= 1", zeroWork.String())
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-4: UTXO Rollback
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestUTXORollback(t *testing.T) {
+	genesis := block.NewGenesisBlock()
+	blocks := []*block.Block{genesis}
+
+	// Build UTXO from genesis.
+	utxoSet, err := utxo.RebuildFromBlocks(blocks)
+	if err != nil {
+		t.Fatalf("RebuildFromBlocks() error: %v", err)
+	}
+
+	// Build a block with a coinbase.
+	tx := block.NewCoinbaseTx("miner", 50, 1)
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+	b := &block.Block{
+		Header: block.BlockHeader{
+			Version: block.BlockVersion, Height: 1,
+			PrevBlockHash: genesis.Hash,
+			MerkleRoot:    block.ComputeMerkleRoot([]string{tx.ID}),
+			Timestamp:     genesis.Header.Timestamp + 600,
+		},
+		Transactions: []block.Transaction{tx},
+	}
+	block.MineBlock(b, easyTarget, 1000)
+
+	// Snapshot, apply, then rollback.
+	inputSnap := utxoSet.SnapshotInputs(b)
+	if err := utxoSet.ApplyBlock(b); err != nil {
+		t.Fatalf("ApplyBlock() error: %v", err)
+	}
+
+	// After apply: miner should have 50.
+	if utxoSet.Balance("miner") != 50 {
+		t.Errorf("miner balance after apply = %f, want 50", utxoSet.Balance("miner"))
+	}
+
+	// Rollback.
+	if err := utxoSet.RollbackBlock(b, inputSnap); err != nil {
+		t.Fatalf("RollbackBlock() error: %v", err)
+	}
+
+	// After rollback: miner should have 0.
+	if utxoSet.Balance("miner") != 0 {
+		t.Errorf("miner balance after rollback = %f, want 0", utxoSet.Balance("miner"))
+	}
+
+	// Genesis balance should be restored.
+	genesisBalance := utxoSet.Balance(block.LegacyGenesisAddress)
+	if genesisBalance != block.GenesisSupply {
+		t.Errorf("genesis balance after rollback = %f, want %f", genesisBalance, block.GenesisSupply)
+	}
+}
+
 // Suppress unused import warnings.
 var _ = time.Now

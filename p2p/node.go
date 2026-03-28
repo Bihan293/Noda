@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Bihan293/Noda/block"
-	"github.com/Bihan293/Noda/chain"
 	"github.com/Bihan293/Noda/ledger"
 )
 
@@ -678,6 +677,10 @@ func (n *Node) handleMessage(p *Peer, msg *Message) error {
 		return n.handleBlock(p, msg)
 	case CmdGetBlocks:
 		return n.handleGetBlocks(p, msg)
+	case CmdGetHeaders:
+		return n.handleGetHeaders(p, msg)
+	case CmdHeaders:
+		return n.handleHeaders(p, msg)
 	case CmdAddr:
 		return n.handleAddr(p, msg)
 	case CmdVersion:
@@ -769,9 +772,13 @@ func (n *Node) handleInv(p *Peer, msg *Message) error {
 		switch item.Type {
 		case InvTypeBlock:
 			p.MarkKnownBlock(item.Hash)
-			// Request blocks we don't have.
+			// CRITICAL-4: Check block index instead of linear scan.
 			bc := n.ledger.GetChain()
-			if bc.GetBlock(0) != nil { // chain exists
+			idx := bc.Index
+			if idx != nil && !idx.HasBlock(item.Hash) && !idx.HasOrphan(item.Hash) {
+				needed = append(needed, item)
+			} else if idx == nil {
+				// Fallback: linear scan.
 				found := false
 				for _, b := range bc.Blocks {
 					if b.Hash == item.Hash {
@@ -814,17 +821,15 @@ func (n *Node) handleGetData(p *Peer, msg *Message) error {
 	for _, item := range inv.Items {
 		switch item.Type {
 		case InvTypeBlock:
-			// Find the block by hash.
-			for _, b := range bc.Blocks {
-				if b.Hash == item.Hash {
-					resp, err := NewMessage(CmdBlock, b)
-					if err != nil {
-						return err
-					}
-					if err := p.Send(resp); err != nil {
-						return fmt.Errorf("send block: %w", err)
-					}
-					break
+			// CRITICAL-4: Use block index for O(1) lookup.
+			b := bc.GetBlockByHash(item.Hash)
+			if b != nil {
+				resp, err := NewMessage(CmdBlock, b)
+				if err != nil {
+					return err
+				}
+				if err := p.Send(resp); err != nil {
+					return fmt.Errorf("send block: %w", err)
 				}
 			}
 		case InvTypeTx:
@@ -923,25 +928,9 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 		"hash", shortHash(b.Hash),
 	)
 
-	// Try to add the block.
-	bc := n.ledger.GetChain()
-	expectedHeight := bc.Height() + 1
-
-	if b.Header.Height != expectedHeight {
-		// Out of order — might need to request missing blocks.
-		if b.Header.Height > expectedHeight {
-			slog.Debug("Block ahead, requesting missing blocks",
-				"block_height", b.Header.Height,
-				"peer", p.Addr,
-				"expected", expectedHeight,
-			)
-			n.requestBlocks(p)
-		}
-		return nil
-	}
-
-	// Validate and add block to chain via ledger.
-	if err := n.addBlockToLedger(&b); err != nil {
+	// CRITICAL-4: Use ProcessBlock which handles orphans and reorg.
+	accepted, isOrphan, err := n.ledger.ProcessBlock(&b)
+	if err != nil {
 		slog.Debug("Block rejected",
 			"height", b.Header.Height,
 			"peer", p.Addr,
@@ -950,6 +939,21 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 		if banned := p.AddBanScore(20, "invalid block"); banned {
 			n.banPeer(p)
 		}
+		return nil
+	}
+
+	if !accepted {
+		// Duplicate block — ignore silently.
+		return nil
+	}
+
+	if isOrphan {
+		// We need the parent — request blocks from this peer.
+		slog.Debug("Orphan block received, requesting missing blocks",
+			"height", b.Header.Height,
+			"peer", p.Addr,
+		)
+		n.requestBlocks(p)
 		return nil
 	}
 
@@ -962,30 +966,6 @@ func (n *Node) handleBlock(p *Peer, msg *Message) error {
 	// Relay to other peers.
 	n.broadcastBlock(&b, p)
 
-	return nil
-}
-
-// addBlockToLedger adds a validated block to the ledger.
-func (n *Node) addBlockToLedger(b *block.Block) error {
-	bc := n.ledger.GetChain()
-
-	// Add block to chain (validates header + PoW + merkle).
-	if err := bc.AddBlock(b); err != nil {
-		return err
-	}
-
-	// Apply block to UTXO set.
-	if err := n.ledger.UTXOSet.ApplyBlock(b); err != nil {
-		return fmt.Errorf("UTXO apply failed: %w", err)
-	}
-
-	// Remove confirmed transactions from mempool.
-	for _, tx := range b.Transactions {
-		n.ledger.Mempool.Remove(tx.ID)
-	}
-
-	// Save ledger.
-	_ = n.ledger.Save()
 	return nil
 }
 
@@ -1019,7 +999,7 @@ func (n *Node) broadcastBlock(b *block.Block, exclude *Peer) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// GetBlocks / Initial Block Download (IBD)
+// GetBlocks / Headers / Initial Block Download (IBD) — CRITICAL-4
 // ──────────────────────────────────────────────────────────────────────────────
 
 // requestBlocks sends a getblocks message to a peer to start IBD.
@@ -1040,6 +1020,27 @@ func (n *Node) requestBlocks(p *Peer) {
 
 	if err := p.Send(msg); err != nil {
 		slog.Debug("Failed to send getblocks", "peer", p.Addr, "error", err)
+	}
+}
+
+// requestHeaders sends a getheaders message for headers-first sync.
+func (n *Node) requestHeaders(p *Peer) {
+	bc := n.ledger.GetChain()
+	fromHash := bc.LastHash()
+
+	payload := &GetHeadersPayload{
+		FromHash: fromHash,
+		Limit:    MaxGetBlocksLimit,
+	}
+
+	msg, err := NewMessage(CmdGetHeaders, payload)
+	if err != nil {
+		slog.Error("Failed to create getheaders message", "error", err)
+		return
+	}
+
+	if err := p.Send(msg); err != nil {
+		slog.Debug("Failed to send getheaders", "peer", p.Addr, "error", err)
 	}
 }
 
@@ -1079,6 +1080,90 @@ func (n *Node) handleGetBlocks(p *Peer, msg *Message) error {
 
 	if len(items) > 0 {
 		resp, err := NewMessage(CmdInv, &InvPayload{Items: items})
+		if err != nil {
+			return err
+		}
+		return p.Send(resp)
+	}
+
+	return nil
+}
+
+// handleGetHeaders responds with block header metadata for headers-first sync.
+func (n *Node) handleGetHeaders(p *Peer, msg *Message) error {
+	var payload GetHeadersPayload
+	if err := DecodePayload(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("decode getheaders: %w", err)
+	}
+
+	bc := n.ledger.GetChain()
+	blocks := bc.Blocks
+
+	// Find the starting point.
+	startIdx := 0
+	if payload.FromHash != "" {
+		for i, b := range blocks {
+			if b.Hash == payload.FromHash {
+				startIdx = i + 1
+				break
+			}
+		}
+	}
+
+	limit := payload.Limit
+	if limit <= 0 || limit > MaxGetBlocksLimit {
+		limit = MaxGetBlocksLimit
+	}
+
+	// Collect headers.
+	var headers []BlockHeaderInfo
+	for i := startIdx; i < len(blocks) && len(headers) < limit; i++ {
+		b := blocks[i]
+		headers = append(headers, BlockHeaderInfo{
+			Hash:       b.Hash,
+			Height:     b.Header.Height,
+			PrevHash:   b.Header.PrevBlockHash,
+			MerkleRoot: b.Header.MerkleRoot,
+			Timestamp:  b.Header.Timestamp,
+			Bits:       b.Header.Bits,
+			Nonce:      b.Header.Nonce,
+			TxCount:    len(b.Transactions),
+		})
+	}
+
+	if len(headers) > 0 {
+		resp, err := NewMessage(CmdHeaders, &HeadersPayload{Headers: headers})
+		if err != nil {
+			return err
+		}
+		return p.Send(resp)
+	}
+
+	return nil
+}
+
+// handleHeaders processes received headers (headers-first sync).
+// After receiving headers, the node requests block bodies for those we need.
+func (n *Node) handleHeaders(p *Peer, msg *Message) error {
+	var payload HeadersPayload
+	if err := DecodePayload(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("decode headers: %w", err)
+	}
+
+	// Request block bodies for headers we don't have.
+	bc := n.ledger.GetChain()
+	var needed []InvItem
+	for _, hdr := range payload.Headers {
+		if bc.GetBlockByHash(hdr.Hash) == nil {
+			needed = append(needed, InvItem{
+				Type: InvTypeBlock,
+				Hash: hdr.Hash,
+			})
+		}
+	}
+
+	if len(needed) > 0 {
+		resp, err := NewMessage(CmdGetData, &InvPayload{Items: needed})
 		if err != nil {
 			return err
 		}
@@ -1210,6 +1295,3 @@ func parsePort(s string) uint16 {
 	fmt.Sscanf(s, "%d", &port)
 	return port
 }
-
-// ensure chain is used (imported)
-var _ = (*chain.Blockchain)(nil)

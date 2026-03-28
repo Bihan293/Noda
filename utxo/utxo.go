@@ -278,6 +278,102 @@ func (s *Set) ApplyBlock(b *block.Block) error {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Rollback — undo a block (CRITICAL-4: reorg support)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// RollbackBlock reverses the effects of a block on the UTXO set.
+// For each transaction (processed in reverse order):
+//   - Regular tx: remove the outputs it created, re-add the outputs it spent.
+//   - Coinbase/genesis tx: remove the outputs it created.
+//
+// The inputValues map provides the original Output for each spent input,
+// keyed by "txID:index". This is needed because the UTXO set no longer has
+// the spent outputs. If inputValues is nil, the caller must provide the block's
+// input context some other way (e.g., from the block data itself with the UTXO
+// that was present before the block was applied).
+//
+// NOTE: For simplicity this implementation requires that inputValues provides
+// the Address and Amount for every input spent by the block's transactions.
+func (s *Set) RollbackBlock(b *block.Block, inputValues map[string]Output) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Process transactions in reverse order.
+	for i := len(b.Transactions) - 1; i >= 0; i-- {
+		tx := b.Transactions[i]
+
+		// Remove outputs created by this transaction.
+		for j := range tx.Outputs {
+			op := OutPoint{TxID: tx.ID, Index: j}
+			key := op.Key()
+			delete(s.utxos, key)
+		}
+
+		// Restore inputs consumed by this transaction (skip coinbase/genesis).
+		if !tx.IsCoinbase() && !tx.IsGenesis() {
+			for _, in_ := range tx.Inputs {
+				op := OutPoint{TxID: in_.PrevTxID, Index: in_.PrevIndex}
+				key := op.Key()
+				prevOut, ok := inputValues[key]
+				if !ok {
+					return fmt.Errorf("rollback: missing input value for %s", key)
+				}
+				s.utxos[key] = &utxoEntry{
+					OutPoint: op,
+					Output:   prevOut,
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Snapshot — for recording input values before applying a block (CRITICAL-4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// SnapshotInputs records the UTXO outputs that will be consumed by the given
+// block's transactions. This must be called BEFORE ApplyBlock so the values
+// can be used later for RollbackBlock.
+func (s *Set) SnapshotInputs(b *block.Block) map[string]Output {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snap := make(map[string]Output)
+	for _, tx := range b.Transactions {
+		if tx.IsCoinbase() || tx.IsGenesis() {
+			continue
+		}
+		for _, in_ := range tx.Inputs {
+			op := OutPoint{TxID: in_.PrevTxID, Index: in_.PrevIndex}
+			key := op.Key()
+			if entry, exists := s.utxos[key]; exists {
+				snap[key] = entry.Output
+			}
+		}
+	}
+	return snap
+}
+
+// Clone creates a deep copy of the UTXO set.
+func (s *Set) Clone() *Set {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	clone := &Set{
+		utxos: make(map[string]*utxoEntry, len(s.utxos)),
+	}
+	for k, v := range s.utxos {
+		clone.utxos[k] = &utxoEntry{
+			OutPoint: v.OutPoint,
+			Output:   v.Output,
+		}
+	}
+	return clone
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Rebuild from blockchain
 // ──────────────────────────────────────────────────────────────────────────────
 

@@ -158,8 +158,8 @@ func main() {
 
 	// ---- Initialize components ----
 	slog.Info("╔══════════════════════════════════════════════════════════════╗")
-	slog.Info("║          Noda Crypto Node — Bitcoin-like v0.7.0            ║")
-	slog.Info("║  UTXO I/O + Mempool + Miner + Fees + Faucet + TCP P2P    ║")
+	slog.Info("║         Noda Crypto Node — Bitcoin-like v0.8.0             ║")
+	slog.Info("║  UTXO I/O + Mempool + Miner + Fees + CumWork + TCP P2P   ║")
 	slog.Info("╚══════════════════════════════════════════════════════════════╝")
 	slog.Info("Configuration",
 		"http_port", *port,
