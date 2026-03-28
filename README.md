@@ -386,7 +386,28 @@ GitHub Actions runs on every push and pull request:
 - `go test ./... -v -race` — full test suite with race detector
 - `go vet ./...` — static analysis
 - `gofmt` — formatting check
+- Fuzz testing for block serialization and P2P message framing
 - Docker build + health check
+
+### Invariant / Property Tests
+
+| Invariant | What it verifies |
+|---|---|
+| `sum(UTXO) == genesis_supply + total_mined` | No coins are created or destroyed outside of coinbase/genesis |
+| `total_supply <= 21,000,000` | Max supply is never exceeded |
+| `faucet_distributed <= 11,000,000` | Faucet cap is enforced |
+| `no double-spend in main chain` | Each outpoint is spent at most once |
+| `mining_rewards <= 10,000,000` | Mining reward cap is enforced |
+
+### Fuzz Tests
+
+| Target | Package | What it fuzzes |
+|---|---|---|
+| `FuzzSerializeTxForHash` | `block/` | Transaction binary serialization |
+| `FuzzMerkleRoot` | `block/` | Merkle tree computation |
+| `FuzzBlockHeaderSerialization` | `block/` | Block header serialization + hashing |
+| `FuzzP2PMessageRoundTrip` | `p2p/` | P2P message write/read round-trip |
+| `FuzzP2PReadMessageMalformed` | `p2p/` | P2P message parser with garbage input |
 
 ## Security
 
@@ -410,11 +431,21 @@ GitHub Actions runs on every push and pull request:
 - **Token bucket rate limiter**: smooth rate control, burst tolerance
 - **Graceful shutdown**: context cancellation, connection draining, 10s timeout
 - **UTXO model**: prevents double-spend, enables parallel validation
-- **Longest-chain rule**: the node with the most cumulative work wins during sync
+- **Cumulative-work chain selection**: the node with the most cumulative PoW work wins during sync (not longest chain)
 - **Offline wallet**: transaction signing happens locally, never over HTTP
-- **JSON storage**: human-readable, easy to debug; fine for a lightweight node
+- **Crash-safe storage**: blockstore + chainstate persistence with atomic writes, recovery, and legacy migration
 - **No external dependencies**: uses only the Go standard library
 - **Multi-stage Docker build**: ~15 MB final image, non-root user, health check included
+
+## Known Limitations
+
+- **Script system**: Noda uses a simplified Ed25519 pubkey model instead of Bitcoin's full Script language. All inputs in a transaction must be from the same address.
+- **Fee rate**: Fee ordering is based on absolute fee, not fee-per-byte (no virtual size calculation yet).
+- **SPV / light clients**: Not supported. All nodes are full nodes.
+- **Wallet CLI**: The wallet package provides building blocks but does not include a standalone CLI binary yet.
+- **Peer discovery**: Bootstrap requires explicit `--tcp-peers` / `--peers` flags. No DNS seeds.
+- **Persistence format**: Blocks are stored as individual JSON files. For very large chains, a binary format (e.g. BoltDB/BadgerDB) would be more efficient.
+- **Network protocol**: P2P messages use JSON payloads inside the binary frame. A full binary payload encoding would be more compact.
 
 ## License
 

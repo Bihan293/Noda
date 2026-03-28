@@ -4,6 +4,31 @@ All notable changes to Noda are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] — 2026-03-28
+
+### Added
+- **Final launch gate** — comprehensive quality gate for public release [HIGH-3]
+  - Invariant tests: `sum(UTXO) == genesis + mined`, no double-spend, faucet cap, mining cap
+  - Property test: `total_supply <= 21,000,000` across all halving eras
+  - Fuzz tests for block serialization (`FuzzSerializeTxForHash`, `FuzzMerkleRoot`, `FuzzBlockHeaderSerialization`)
+  - Fuzz tests for P2P message framing (`FuzzP2PMessageRoundTrip`, `FuzzP2PReadMessageMalformed`)
+  - Full tx lifecycle integration test: build → sign → mempool → mine → confirm
+  - Restart persistence round-trip test with multiple blocks and transactions
+  - Competing branches + reorg test with UTXO consistency verification
+  - Multi-node sync after divergence test
+  - Faucet bootstrap and exhaust simulation test
+  - Mining reward clamping at 10M cap test
+- **Enhanced CI pipeline** — GitHub Actions now includes:
+  - Fuzz tests for block and P2P packages
+  - All invariant/property tests run with race detector
+- **Known Limitations** section in README — honest disclosure of current scope
+
+### Changed
+- README updated: corrected "longest chain" → "cumulative work" chain selection
+- README updated: "JSON storage" → "crash-safe blockstore + chainstate"
+- ROADMAP updated: all stages marked as Done including Stage 4 (Storage + Chain Reorg)
+- CHANGELOG updated with complete version history
+
 ## [0.5.0] — 2026-03-27
 
 ### Added

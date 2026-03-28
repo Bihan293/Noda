@@ -666,3 +666,80 @@ func TestIsLegacyBlock_NewFormat(t *testing.T) {
 		t.Error("genesis block should not be detected as legacy")
 	}
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HIGH-3: Fuzz Tests for Serialization
+// ══════════════════════════════════════════════════════════════════════════════
+
+// FuzzSerializeTxForHash ensures SerializeTxForHash does not panic on arbitrary input.
+func FuzzSerializeTxForHash(f *testing.F) {
+	// Seed corpus with typical transactions.
+	f.Add(uint32(1), "aaaa", 0, 100.0, "bbbb", "coinbase:1")
+	f.Add(uint32(0), "", 0, 0.0, "", "")
+	f.Add(uint32(255), "ff", 99, 99999.999, "cc", "genesis")
+
+	f.Fuzz(func(t *testing.T, version uint32, prevTxID string, prevIndex int, amount float64, address string, cbData string) {
+		tx := &Transaction{
+			Version: version,
+			Inputs: []TxInput{
+				{PrevTxID: prevTxID, PrevIndex: prevIndex},
+			},
+			Outputs: []TxOutput{
+				{Amount: amount, Address: address},
+			},
+			CoinbaseData: cbData,
+		}
+		// Must not panic.
+		data := SerializeTxForHash(tx)
+		if data == nil {
+			t.Error("SerializeTxForHash returned nil")
+		}
+
+		// Hash must not panic and must return a 64-char hex string.
+		hash := HashTransaction(tx)
+		if len(hash) != 64 {
+			t.Errorf("hash length = %d, want 64", len(hash))
+		}
+
+		// Sighash must not panic.
+		sighash := ComputeSighash(tx)
+		if len(sighash) != 32 {
+			t.Errorf("sighash length = %d, want 32", len(sighash))
+		}
+	})
+}
+
+// FuzzMerkleRoot ensures ComputeMerkleRoot does not panic on arbitrary inputs.
+func FuzzMerkleRoot(f *testing.F) {
+	f.Add("aabbccdd")
+	f.Add("0011")
+	f.Add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	f.Fuzz(func(t *testing.T, txID string) {
+		// Must not panic regardless of input.
+		_ = ComputeMerkleRoot([]string{txID})
+		_ = ComputeMerkleRoot([]string{txID, txID})
+	})
+}
+
+// FuzzBlockHeaderSerialization ensures serializeHeader + HashBlockHeader don't panic.
+func FuzzBlockHeaderSerialization(f *testing.F) {
+	f.Add(uint32(2), uint64(0), "0000", "aaaa", int64(1000), "00ff", uint64(42))
+
+	f.Fuzz(func(t *testing.T, version uint32, height uint64, prevHash string, merkle string, timestamp int64, bits string, nonce uint64) {
+		h := BlockHeader{
+			Version:       version,
+			Height:        height,
+			PrevBlockHash: prevHash,
+			MerkleRoot:    merkle,
+			Timestamp:     timestamp,
+			Bits:          bits,
+			Nonce:         nonce,
+		}
+		// Must not panic.
+		hash := HashBlockHeader(h)
+		if hash == "" {
+			t.Error("HashBlockHeader returned empty string")
+		}
+	})
+}

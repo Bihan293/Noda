@@ -762,3 +762,93 @@ func TestValidCommands(t *testing.T) {
 		t.Error("validCommands[badcmd] should be false")
 	}
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HIGH-3: Fuzz Tests for P2P message framing
+// ══════════════════════════════════════════════════════════════════════════════
+
+// FuzzP2PMessageRoundTrip fuzzes the write+read cycle via net.Pipe.
+func FuzzP2PMessageRoundTrip(f *testing.F) {
+	f.Add("version", []byte(`{"version":1}`))
+	f.Add("ping", []byte(`{}`))
+	f.Add("tx", []byte(`{"id":"abc"}`))
+
+	f.Fuzz(func(t *testing.T, command string, payload []byte) {
+		// Only test with valid commands to avoid false negatives from validation.
+		if !validCommands[command] {
+			return
+		}
+		// Skip oversized payloads.
+		if len(payload) > 1024*1024 {
+			return
+		}
+
+		msg := &Message{
+			Command: command,
+			Payload: payload,
+		}
+
+		// Create a net.Pipe for in-memory testing.
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		// Write in a goroutine.
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- WriteMessage(client, msg)
+		}()
+
+		// Read from the other end.
+		got, err := ReadMessage(server)
+		if writeErr := <-errCh; writeErr != nil {
+			// Write failure is acceptable for fuzzing.
+			return
+		}
+		if err != nil {
+			t.Fatalf("ReadMessage failed: %v", err)
+		}
+
+		if got.Command != command {
+			t.Errorf("command = %q, want %q", got.Command, command)
+		}
+		if !bytes.Equal(got.Payload, payload) {
+			t.Errorf("payload mismatch: got %d bytes, want %d bytes", len(got.Payload), len(payload))
+		}
+	})
+}
+
+// FuzzP2PReadMessageMalformed ensures ReadMessage handles garbage gracefully.
+func FuzzP2PReadMessageMalformed(f *testing.F) {
+	// Seed with various malformed headers.
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
+	f.Add([]byte("NODA"))
+
+	// Valid magic + garbage.
+	hdr := make([]byte, 24)
+	binary.LittleEndian.PutUint32(hdr[0:4], MagicBytes)
+	f.Add(hdr)
+
+	// Valid header with bad checksum.
+	cmdBytes := commandToBytes("ping")
+	copy(hdr[4:16], cmdBytes[:])
+	binary.LittleEndian.PutUint32(hdr[16:20], 0) // zero payload
+	checksum := sha256.Sum256(nil)
+	copy(hdr[20:24], checksum[:4])
+	f.Add(hdr)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		// Write raw bytes.
+		go func() {
+			client.Write(data)
+			client.Close()
+		}()
+
+		// ReadMessage should not panic.
+		_, _ = ReadMessage(server)
+	})
+}

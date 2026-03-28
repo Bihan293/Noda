@@ -1399,5 +1399,684 @@ func TestBlockstoreRecoveryAfterPartialWrite(t *testing.T) {
 	}
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// HIGH-3: FINAL LAUNCH GATE — Integration, Invariant, and Property Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Invariant: sum(UTXO) == genesis + mined
+// ──────────────────────────────────────────────────────────────────────────────
+
+// computeUTXOSum returns the total value of all unspent outputs in the UTXO set.
+func computeUTXOSum(s *utxo.Set) float64 {
+	all := s.GetAllUTXOs()
+	var total float64
+	for _, u := range all {
+		total += u.Output.Amount
+	}
+	return total
+}
+
+func TestInvariant_UTXOSumEqualsSupply(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// After genesis, UTXO sum should equal genesis supply.
+	sum := computeUTXOSum(l.UTXOSet)
+	if sum != block.GenesisSupply {
+		t.Fatalf("UTXO sum after genesis = %f, want %f", sum, block.GenesisSupply)
+	}
+
+	// Send a transaction and mine it.
+	recvKP, _ := crypto.GenerateKeyPair()
+	tx, err := l.BuildTransaction(privHex, kp.Address, recvKP.Address, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SubmitTransaction(*tx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mine the tx.
+	cfg := miner.Config{
+		Enabled: true, MinerAddress: minerKP.Address,
+		BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+	}
+	mn := miner.New(cfg, l)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go mn.Run(ctx)
+	waitMempoolEmpty(t, l, 5*time.Second)
+	cancel()
+
+	// After mining: UTXO sum should equal genesis + mined.
+	sum = computeUTXOSum(l.UTXOSet)
+	expectedTotal := block.GenesisSupply + l.GetChain().TotalMined
+	if !almostEqual(sum, expectedTotal, 0.0001) {
+		t.Errorf("UTXO sum = %f, expected (genesis+mined) = %f", sum, expectedTotal)
+	}
+}
+
+func TestInvariant_TotalSupplyNeverExceeds21M(t *testing.T) {
+	// Verify that genesis + max mining never exceeds 21M.
+	if block.GenesisSupply+block.MaxMiningSupply > block.MaxTotalSupply {
+		t.Fatalf("GenesisSupply(%f) + MaxMiningSupply(%f) > MaxTotalSupply(%f)",
+			block.GenesisSupply, block.MaxMiningSupply, block.MaxTotalSupply)
+	}
+
+	// Simulate mining rewards up to the cap and verify total never exceeds 21M.
+	totalMined := 0.0
+	for h := uint64(1); h < 10*block.HalvingInterval; h++ {
+		reward := block.BlockReward(h, totalMined)
+		if reward == 0 {
+			break
+		}
+		totalMined += reward
+		total := block.GenesisSupply + totalMined
+		if total > block.MaxTotalSupply+0.0001 {
+			t.Fatalf("Total supply at height %d = %f, exceeds %f",
+				h, total, block.MaxTotalSupply)
+		}
+	}
+
+	// Final total mined should not exceed MaxMiningSupply.
+	if totalMined > block.MaxMiningSupply+0.0001 {
+		t.Errorf("Total mined = %f, exceeds MaxMiningSupply(%f)", totalMined, block.MaxMiningSupply)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Invariant: faucet never distributes above cap
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestInvariant_FaucetNeverExceedsCap(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatal(err)
+	}
+
+	// Distribute faucet coins to many recipients.
+	const numClaims = 5
+	for i := 0; i < numClaims; i++ {
+		recvKP, _ := crypto.GenerateKeyPair()
+		_, err := l.ProcessFaucet(recvKP.Address)
+		if err != nil {
+			// May fail near the end if we run out — that's fine.
+			break
+		}
+
+		// Mine the faucet tx.
+		cfg := miner.Config{
+			Enabled: true, MinerAddress: minerKP.Address,
+			BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+		}
+		mn := miner.New(cfg, l)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		go mn.Run(ctx)
+		waitMempoolEmpty(t, l, 5*time.Second)
+		cancel()
+
+		// Check invariant.
+		if l.FaucetTotalDistributed() > ledger.FaucetGlobalCap {
+			t.Fatalf("Faucet total distributed = %f, exceeds cap %f",
+				l.FaucetTotalDistributed(), ledger.FaucetGlobalCap)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Invariant: no double-spend in main chain
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestInvariant_NoDoubleSpendAcrossMainChain(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// Make several transactions.
+	for i := 0; i < 3; i++ {
+		recvKP, _ := crypto.GenerateKeyPair()
+		tx, err := l.BuildTransaction(privHex, kp.Address, recvKP.Address, 100)
+		if err != nil {
+			t.Fatalf("BuildTransaction(%d): %v", i, err)
+		}
+		if err := l.SubmitTransaction(*tx); err != nil {
+			t.Fatalf("SubmitTransaction(%d): %v", i, err)
+		}
+
+		// Mine each tx.
+		cfg := miner.Config{
+			Enabled: true, MinerAddress: minerKP.Address,
+			BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+		}
+		mn := miner.New(cfg, l)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		go mn.Run(ctx)
+		waitMempoolEmpty(t, l, 5*time.Second)
+		cancel()
+	}
+
+	// Scan entire chain for double-spends.
+	spentOutpoints := make(map[string]uint64) // outpoint -> block height
+	bc := l.GetChain()
+	for _, b := range bc.Blocks {
+		for _, tx := range b.Transactions {
+			if tx.IsCoinbase() || tx.IsGenesis() {
+				continue
+			}
+			for _, in_ := range tx.Inputs {
+				key := fmt.Sprintf("%s:%d", in_.PrevTxID, in_.PrevIndex)
+				if prevHeight, exists := spentOutpoints[key]; exists {
+					t.Fatalf("Double-spend detected! Outpoint %s spent in block %d and block %d",
+						key, prevHeight, b.Header.Height)
+				}
+				spentOutpoints[key] = b.Header.Height
+			}
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// End-to-End: Full tx lifecycle: build → sign → mempool → mine → confirm
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFullTxLifecycle(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+	recvKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// 1. Build transaction.
+	amount := 500.0
+	tx, err := l.BuildTransaction(privHex, kp.Address, recvKP.Address, amount)
+	if err != nil {
+		t.Fatalf("BuildTransaction: %v", err)
+	}
+
+	// 2. Verify it's signed.
+	if tx.Inputs[0].Signature == "" {
+		t.Fatal("transaction should be signed")
+	}
+
+	// 3. Validate.
+	if err := l.ValidateUserTx(*tx); err != nil {
+		t.Fatalf("ValidateUserTx: %v", err)
+	}
+
+	// 4. Submit to mempool.
+	if err := l.SubmitTransaction(*tx); err != nil {
+		t.Fatalf("SubmitTransaction: %v", err)
+	}
+	if l.GetMempoolSize() != 1 {
+		t.Fatalf("mempool size = %d, want 1", l.GetMempoolSize())
+	}
+
+	// 5. Balance should NOT have changed yet.
+	if l.GetBalance(recvKP.Address) != 0 {
+		t.Errorf("receiver balance before mining = %f, want 0", l.GetBalance(recvKP.Address))
+	}
+
+	// 6. Mine.
+	cfg := miner.Config{
+		Enabled: true, MinerAddress: minerKP.Address,
+		BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+	}
+	mn := miner.New(cfg, l)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go mn.Run(ctx)
+	waitMempoolEmpty(t, l, 5*time.Second)
+	cancel()
+
+	// 7. Confirm: mempool empty, balance updated.
+	if l.GetMempoolSize() != 0 {
+		t.Errorf("mempool size after mining = %d, want 0", l.GetMempoolSize())
+	}
+	if l.GetBalance(recvKP.Address) != amount {
+		t.Errorf("receiver balance after mining = %f, want %f", l.GetBalance(recvKP.Address), amount)
+	}
+
+	// 8. Verify UTXO sum invariant.
+	sum := computeUTXOSum(l.UTXOSet)
+	expectedTotal := block.GenesisSupply + l.GetChain().TotalMined
+	if !almostEqual(sum, expectedTotal, 0.0001) {
+		t.Errorf("UTXO sum = %f, expected = %f", sum, expectedTotal)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mining rewards never exceed 10M cap
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestMiningRewardsDoNotExceedCap(t *testing.T) {
+	// Simulate mining many blocks and verify total never exceeds 10M.
+	totalMined := 0.0
+	prevReward := block.InitialBlockReward
+
+	for h := uint64(1); h < 5*block.HalvingInterval; h++ {
+		reward := block.BlockReward(h, totalMined)
+		if reward == 0 {
+			break
+		}
+		totalMined += reward
+
+		// Reward should never be negative.
+		if reward < 0 {
+			t.Fatalf("Negative reward %f at height %d", reward, h)
+		}
+
+		// Reward should be <= previous reward (halving).
+		if reward > prevReward+0.0001 {
+			t.Errorf("Reward at height %d (%f) > previous (%f)", h, reward, prevReward)
+		}
+		prevReward = reward
+
+		// Total mined should never exceed cap.
+		if totalMined > block.MaxMiningSupply+0.0001 {
+			t.Fatalf("Total mined %f exceeds cap %f at height %d",
+				totalMined, block.MaxMiningSupply, h)
+		}
+	}
+
+	t.Logf("Mining simulation: total mined = %f (cap: %f)", totalMined, block.MaxMiningSupply)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Restart persistence: full round-trip with multiple blocks and transactions
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestRestartPersistenceFullRoundTrip(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+	minerKP, _ := crypto.GenerateKeyPair()
+	path := tmpFile(t)
+
+	// Session 1: Create ledger, send multiple txs, mine multiple blocks.
+	l1 := ledger.NewLedgerWithOwner(path, kp.Address)
+	if err := l1.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatal(err)
+	}
+
+	// Faucet + manual send.
+	recv1, _ := crypto.GenerateKeyPair()
+	_, err = l1.ProcessFaucet(recv1.Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mine faucet tx.
+	cfg := miner.Config{
+		Enabled: true, MinerAddress: minerKP.Address,
+		BlockMaxTx: 100, Interval: 50 * time.Millisecond, MaxAttempts: 10_000_000,
+	}
+	mn := miner.New(cfg, l1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	go mn.Run(ctx)
+	waitMempoolEmpty(t, l1, 5*time.Second)
+	cancel()
+
+	// Another tx.
+	recv2, _ := crypto.GenerateKeyPair()
+	tx, err := l1.BuildTransaction(privHex, kp.Address, recv2.Address, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l1.SubmitTransaction(*tx); err != nil {
+		t.Fatal(err)
+	}
+
+	mn2 := miner.New(cfg, l1)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	go mn2.Run(ctx2)
+	waitMempoolEmpty(t, l1, 5*time.Second)
+	cancel2()
+
+	// Record state.
+	heightBefore := l1.GetChainHeight()
+	utxoSumBefore := computeUTXOSum(l1.UTXOSet)
+	recv1BalBefore := l1.GetBalance(recv1.Address)
+	recv2BalBefore := l1.GetBalance(recv2.Address)
+	totalMinedBefore := l1.GetChain().TotalMined
+	totalFaucetBefore := l1.GetChain().TotalFaucet
+
+	l1.Save()
+
+	// Session 2: reload.
+	l2 := ledger.LoadLedgerWithOwner(path, kp.Address)
+
+	if l2.GetChainHeight() != heightBefore {
+		t.Errorf("height: got %d, want %d", l2.GetChainHeight(), heightBefore)
+	}
+	if l2.GetBalance(recv1.Address) != recv1BalBefore {
+		t.Errorf("recv1 balance: got %f, want %f", l2.GetBalance(recv1.Address), recv1BalBefore)
+	}
+	if l2.GetBalance(recv2.Address) != recv2BalBefore {
+		t.Errorf("recv2 balance: got %f, want %f", l2.GetBalance(recv2.Address), recv2BalBefore)
+	}
+	if l2.GetChain().TotalMined != totalMinedBefore {
+		t.Errorf("TotalMined: got %f, want %f", l2.GetChain().TotalMined, totalMinedBefore)
+	}
+	if l2.GetChain().TotalFaucet != totalFaucetBefore {
+		t.Errorf("TotalFaucet: got %f, want %f", l2.GetChain().TotalFaucet, totalFaucetBefore)
+	}
+	utxoSumAfter := computeUTXOSum(l2.UTXOSet)
+	if !almostEqual(utxoSumAfter, utxoSumBefore, 0.0001) {
+		t.Errorf("UTXO sum: got %f, want %f", utxoSumAfter, utxoSumBefore)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Competing branches + reorg — verify UTXO is consistent after reorg
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestCompetingBranchesReorgUTXOConsistency(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerKP, _ := crypto.GenerateKeyPair()
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+
+	// Build the current chain by mining a coinbase block.
+	easyTarget := new(big.Int)
+	easyTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+	hardTarget := new(big.Int)
+	hardTarget.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Mine 2 easy blocks onto the ledger.
+	for i := uint64(1); i <= 2; i++ {
+		cb := block.NewCoinbaseTx(minerKP.Address, 50, i)
+		merkle := block.ComputeMerkleRoot([]string{cb.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version: block.BlockVersion, Height: i,
+				PrevBlockHash: l.GetChain().LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     l.GetChain().LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{cb},
+		}
+		block.MineBlock(b, easyTarget, 1000)
+		if err := l.ApplyMinedBlock(b, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Record pre-reorg UTXO sum.
+	preReorgSum := computeUTXOSum(l.UTXOSet)
+	if l.GetChainHeight() != 2 {
+		t.Fatalf("height = %d, want 2", l.GetChainHeight())
+	}
+
+	// Build alternative chain from genesis with MORE cumulative work.
+	altBC := chain.NewBlockchainWithOwner(kp.Address)
+	altMiner, _ := crypto.GenerateKeyPair()
+	for i := uint64(1); i <= 3; i++ {
+		cb := block.NewCoinbaseTx(altMiner.Address, 50, i)
+		merkle := block.ComputeMerkleRoot([]string{cb.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version: block.BlockVersion, Height: i,
+				PrevBlockHash: altBC.LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     altBC.LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{cb},
+		}
+		if err := block.MineBlock(b, hardTarget, 100_000_000); err != nil {
+			t.Fatalf("alt chain mine %d: %v", i, err)
+		}
+		if err := altBC.AddBlock(b); err != nil {
+			t.Fatalf("alt chain add %d: %v", i, err)
+		}
+	}
+
+	// Replace with alternative chain.
+	replaced := l.ReplaceChain(altBC)
+	if !replaced {
+		t.Fatal("should accept alternative chain with more work")
+	}
+
+	// Verify UTXO sum after reorg.
+	postReorgSum := computeUTXOSum(l.UTXOSet)
+	expectedTotal := block.GenesisSupply + l.GetChain().TotalMined
+	if !almostEqual(postReorgSum, expectedTotal, 0.0001) {
+		t.Errorf("post-reorg UTXO sum = %f, expected = %f (genesis+mined=%f+%f)",
+			postReorgSum, expectedTotal, block.GenesisSupply, l.GetChain().TotalMined)
+	}
+
+	// Pre-reorg miner should have 0 balance (their blocks were disconnected).
+	if l.GetBalance(minerKP.Address) != 0 {
+		t.Errorf("old miner balance after reorg = %f, want 0", l.GetBalance(minerKP.Address))
+	}
+
+	// Alt miner should have rewards.
+	if l.GetBalance(altMiner.Address) <= 0 {
+		t.Error("alt miner should have rewards after reorg")
+	}
+
+	_ = preReorgSum // used for reference
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Multi-node sync after divergence (simulated)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestMultiNodeSyncAfterDivergence(t *testing.T) {
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerA, _ := crypto.GenerateKeyPair()
+	minerB, _ := crypto.GenerateKeyPair()
+
+	hardTarget := new(big.Int)
+	hardTarget.SetString("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Node A: genesis + 2 blocks.
+	lA := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+	for i := uint64(1); i <= 2; i++ {
+		cb := block.NewCoinbaseTx(minerA.Address, 50, i)
+		merkle := block.ComputeMerkleRoot([]string{cb.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version: block.BlockVersion, Height: i,
+				PrevBlockHash: lA.GetChain().LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     lA.GetChain().LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{cb},
+		}
+		if err := block.MineBlock(b, hardTarget, 100_000_000); err != nil {
+			t.Fatal(err)
+		}
+		if err := lA.ApplyMinedBlock(b, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Node B: genesis + 3 blocks (longer AND more work).
+	bcB := chain.NewBlockchainWithOwner(kp.Address)
+	for i := uint64(1); i <= 3; i++ {
+		cb := block.NewCoinbaseTx(minerB.Address, 50, i)
+		merkle := block.ComputeMerkleRoot([]string{cb.ID})
+		b := &block.Block{
+			Header: block.BlockHeader{
+				Version: block.BlockVersion, Height: i,
+				PrevBlockHash: bcB.LastHash(),
+				MerkleRoot:    merkle,
+				Timestamp:     bcB.LastBlock().Header.Timestamp + 600,
+			},
+			Transactions: []block.Transaction{cb},
+		}
+		if err := block.MineBlock(b, hardTarget, 100_000_000); err != nil {
+			t.Fatal(err)
+		}
+		if err := bcB.AddBlock(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Simulate Node A syncing from Node B.
+	workA := lA.GetChain().CumulativeWork()
+	workB := bcB.CumulativeWork()
+	if workB.Cmp(workA) <= 0 {
+		t.Fatal("Node B should have more work")
+	}
+
+	replaced := lA.ReplaceChain(bcB)
+	if !replaced {
+		t.Fatal("Node A should accept Node B's chain")
+	}
+
+	// After sync, Node A should have Node B's state.
+	if lA.GetChainHeight() != bcB.Height() {
+		t.Errorf("height after sync: got %d, want %d", lA.GetChainHeight(), bcB.Height())
+	}
+
+	// Miner A should have 0 (their blocks were replaced).
+	if lA.GetBalance(minerA.Address) != 0 {
+		t.Errorf("miner A balance after sync = %f, want 0", lA.GetBalance(minerA.Address))
+	}
+
+	// Miner B should have rewards.
+	if lA.GetBalance(minerB.Address) <= 0 {
+		t.Error("miner B should have rewards after sync")
+	}
+
+	// UTXO invariant.
+	sum := computeUTXOSum(lA.UTXOSet)
+	expectedTotal := block.GenesisSupply + lA.GetChain().TotalMined
+	if !almostEqual(sum, expectedTotal, 0.0001) {
+		t.Errorf("UTXO sum after sync = %f, expected = %f", sum, expectedTotal)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mining rewards cap when approaching 10M limit
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestMiningRewardClampedAtCap(t *testing.T) {
+	// If totalMined is very close to MaxMiningSupply, reward should be clamped.
+	almostFull := block.MaxMiningSupply - 10.0 // only 10 coins left
+	reward := block.BlockReward(1, almostFull)
+	if reward > 10.0+0.0001 {
+		t.Errorf("reward near cap = %f, should be <= 10.0", reward)
+	}
+
+	// At exactly the cap, reward should be 0.
+	atCap := block.MaxMiningSupply
+	reward = block.BlockReward(1, atCap)
+	if reward != 0 {
+		t.Errorf("reward at cap = %f, want 0", reward)
+	}
+
+	// Past the cap, reward should be 0.
+	pastCap := block.MaxMiningSupply + 1.0
+	reward = block.BlockReward(1, pastCap)
+	if reward != 0 {
+		t.Errorf("reward past cap = %f, want 0", reward)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Faucet bootstrap and exhaust simulation
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFaucetBootstrapAndExhaustSimulation(t *testing.T) {
+	// We can't distribute all 11M in a test (2200 claims × mining), so we verify:
+	// 1. FaucetGlobalCap == GenesisSupply == 11_000_000
+	// 2. Each claim is exactly FaucetAmount (5000)
+	// 3. Faucet correctly rejects when exhausted
+
+	if ledger.FaucetGlobalCap != block.GenesisSupply {
+		t.Fatalf("FaucetGlobalCap(%f) != GenesisSupply(%f)", ledger.FaucetGlobalCap, block.GenesisSupply)
+	}
+
+	maxClaims := int(ledger.FaucetGlobalCap / ledger.FaucetAmount)
+	expectedMaxClaims := 2200 // 11_000_000 / 5_000
+	if maxClaims != expectedMaxClaims {
+		t.Errorf("max faucet claims = %d, want %d", maxClaims, expectedMaxClaims)
+	}
+
+	// Verify the faucet function rejects when manually set to exhausted.
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	privHex := hex.EncodeToString(kp.PrivateKey)
+
+	l := ledger.NewLedgerWithOwner(tmpFile(t), kp.Address)
+	if err := l.SetFaucetKeyAndValidateGenesis(privHex); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually set TotalFaucet to the cap.
+	l.GetChain().TotalFaucet = ledger.FaucetGlobalCap
+
+	// Attempt to claim.
+	recvKP, _ := crypto.GenerateKeyPair()
+	_, err = l.ProcessFaucet(recvKP.Address)
+	if err == nil {
+		t.Fatal("faucet should reject when exhausted")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+func waitMempoolEmpty(t *testing.T, l *ledger.Ledger, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("mempool not empty after %v (size=%d)", timeout, l.GetMempoolSize())
+		default:
+			if l.GetMempoolSize() == 0 {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func almostEqual(a, b, epsilon float64) bool {
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff < epsilon
+}
+
 // Suppress unused import warnings.
 var _ = time.Now
+var _ = os.Remove

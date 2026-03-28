@@ -45,6 +45,17 @@ jobs:
             exit 1
           fi
 
+      - name: Fuzz tests (block serializer/parser)
+        run: |
+          go test -fuzz=FuzzSerializeTxForHash -fuzztime=15s ./block/
+          go test -fuzz=FuzzMerkleRoot -fuzztime=10s ./block/
+          go test -fuzz=FuzzBlockHeaderSerialization -fuzztime=10s ./block/
+
+      - name: Fuzz tests (P2P message framing)
+        run: |
+          go test -fuzz=FuzzP2PMessageRoundTrip -fuzztime=10s ./p2p/
+          go test -fuzz=FuzzP2PReadMessageMalformed -fuzztime=10s ./p2p/
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
@@ -64,4 +75,3 @@ jobs:
           curl -sf http://localhost:3000/health || exit 1
           docker stop noda-test
           docker rm noda-test
-          
