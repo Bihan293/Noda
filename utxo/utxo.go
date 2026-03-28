@@ -180,6 +180,31 @@ func (s *Set) GetUTXOsForAddress(address string) []struct {
 	return result
 }
 
+// GetAllUTXOs returns all unspent outputs in the set.
+// HIGH-1: Used for serialising the UTXO set to the chainstate snapshot.
+func (s *Set) GetAllUTXOs() []struct {
+	OutPoint OutPoint
+	Output   Output
+} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]struct {
+		OutPoint OutPoint
+		Output   Output
+	}, 0, len(s.utxos))
+	for _, entry := range s.utxos {
+		result = append(result, struct {
+			OutPoint OutPoint
+			Output   Output
+		}{
+			OutPoint: entry.OutPoint,
+			Output:   entry.Output,
+		})
+	}
+	return result
+}
+
 // FindUTXOsForAmount finds enough UTXOs from the given address to cover the
 // requested amount. Returns the selected UTXOs and the total value.
 // Returns an error if insufficient funds.
