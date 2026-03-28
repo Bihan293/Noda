@@ -12,14 +12,14 @@ import (
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestConstants(t *testing.T) {
-	if GenesisSupply != 11_000_000 {
-		t.Errorf("GenesisSupply = %f, want 11000000", GenesisSupply)
+	if GenesisSupply != 1_000_000 {
+		t.Errorf("GenesisSupply = %f, want 1000000", GenesisSupply)
 	}
 	if MaxTotalSupply != 21_000_000 {
 		t.Errorf("MaxTotalSupply = %f, want 21000000", MaxTotalSupply)
 	}
-	if MaxMiningSupply != 10_000_000 {
-		t.Errorf("MaxMiningSupply = %f, want 10000000", MaxMiningSupply)
+	if MaxMiningSupply != 20_000_000 {
+		t.Errorf("MaxMiningSupply = %f, want 20000000", MaxMiningSupply)
 	}
 	if InitialBlockReward != 50.0 {
 		t.Errorf("InitialBlockReward = %f, want 50", InitialBlockReward)
