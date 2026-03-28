@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -20,9 +21,46 @@ func TestMagicBytes(t *testing.T) {
 }
 
 func TestHeaderSize(t *testing.T) {
-	// 4 (magic) + 12 (command) + 4 (payload length) = 20.
-	if HeaderSize != 20 {
-		t.Errorf("HeaderSize = %d, want 20", HeaderSize)
+	// HIGH-2: 4 (magic) + 12 (command) + 4 (payload length) + 4 (checksum) = 24.
+	if HeaderSize != 24 {
+		t.Errorf("HeaderSize = %d, want 24", HeaderSize)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Checksum (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestPayloadChecksum(t *testing.T) {
+	data := []byte(`{"nonce":42}`)
+	cs := payloadChecksum(data)
+	// The checksum should be deterministic.
+	cs2 := payloadChecksum(data)
+	if cs != cs2 {
+		t.Error("payloadChecksum is not deterministic")
+	}
+
+	// Different data → different checksum.
+	cs3 := payloadChecksum([]byte(`{"nonce":99}`))
+	if cs == cs3 {
+		t.Error("payloadChecksum should differ for different data")
+	}
+
+	// Manually verify: first 4 bytes of double-SHA-256.
+	first := sha256.Sum256(data)
+	second := sha256.Sum256(first[:])
+	var expected [ChecksumSize]byte
+	copy(expected[:], second[:ChecksumSize])
+	if cs != expected {
+		t.Errorf("payloadChecksum mismatch: got %x, want %x", cs, expected)
+	}
+}
+
+func TestPayloadChecksum_EmptyPayload(t *testing.T) {
+	cs := payloadChecksum(nil)
+	cs2 := payloadChecksum([]byte{})
+	if cs != cs2 {
+		t.Error("nil and empty should produce the same checksum")
 	}
 }
 
@@ -128,6 +166,9 @@ func TestReadMessage_BadMagic(t *testing.T) {
 		cmd := commandToBytes(CmdPing)
 		copy(header[4:16], cmd[:])
 		binary.LittleEndian.PutUint32(header[16:20], 0) // No payload.
+		// Checksum for empty payload.
+		cs := payloadChecksum(nil)
+		copy(header[20:24], cs[:])
 		client.Write(header)
 	}()
 
@@ -150,6 +191,61 @@ func TestWriteMessage_PayloadTooLarge(t *testing.T) {
 	err := WriteMessage(client, msg)
 	if err == nil {
 		t.Error("WriteMessage() should fail for payload too large")
+	}
+}
+
+// HIGH-2: Test bad checksum detection.
+func TestReadMessage_BadChecksum(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	payloadData := []byte(`{"nonce":42}`)
+
+	go func() {
+		header := make([]byte, HeaderSize)
+		binary.LittleEndian.PutUint32(header[0:4], MagicBytes)
+		cmd := commandToBytes(CmdPing)
+		copy(header[4:16], cmd[:])
+		binary.LittleEndian.PutUint32(header[16:20], uint32(len(payloadData)))
+		// Write WRONG checksum (all 0xFF).
+		header[20] = 0xFF
+		header[21] = 0xFF
+		header[22] = 0xFF
+		header[23] = 0xFF
+		client.Write(header)
+		client.Write(payloadData)
+	}()
+
+	_, err := ReadMessage(server)
+	if err == nil {
+		t.Error("ReadMessage() should fail with bad checksum")
+	}
+	if err != ErrBadChecksum {
+		t.Errorf("ReadMessage() error = %v, want ErrBadChecksum", err)
+	}
+}
+
+// HIGH-2: Test unknown command rejection.
+func TestReadMessage_UnknownCommand(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		header := make([]byte, HeaderSize)
+		binary.LittleEndian.PutUint32(header[0:4], MagicBytes)
+		cmd := commandToBytes("badcmd")
+		copy(header[4:16], cmd[:])
+		binary.LittleEndian.PutUint32(header[16:20], 0) // No payload.
+		cs := payloadChecksum(nil)
+		copy(header[20:24], cs[:])
+		client.Write(header)
+	}()
+
+	_, err := ReadMessage(server)
+	if err == nil {
+		t.Error("ReadMessage() should fail with unknown command")
 	}
 }
 
@@ -350,6 +446,135 @@ func TestPeer_SendDisconnected(t *testing.T) {
 	}
 }
 
+// HIGH-2: Test per-peer rate limiting.
+func TestPeer_RecordMessage_RateLimit(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	p := NewPeer(client, false)
+
+	// Should be allowed up to PeerMaxMsgsPerWindow messages.
+	for i := 0; i < PeerMaxMsgsPerWindow; i++ {
+		if !p.RecordMessage() {
+			t.Fatalf("RecordMessage() returned false at message %d (should be allowed up to %d)", i, PeerMaxMsgsPerWindow)
+		}
+	}
+
+	// The next message should be rejected.
+	if p.RecordMessage() {
+		t.Error("RecordMessage() should return false after exceeding rate limit")
+	}
+}
+
+// HIGH-2: Test getdata outstanding limit.
+func TestPeer_GetDataLimit(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	p := NewPeer(client, false)
+
+	// Increment up to limit.
+	ok := p.IncrGetData(MaxGetDataOutstanding)
+	if !ok {
+		t.Error("IncrGetData should succeed up to limit")
+	}
+
+	// Exceeding limit should fail.
+	ok = p.IncrGetData(1)
+	if ok {
+		t.Error("IncrGetData should fail when limit exceeded")
+	}
+
+	// Decrement and try again.
+	p.DecrGetData(100)
+	ok = p.IncrGetData(100)
+	if !ok {
+		t.Error("IncrGetData should succeed after DecrGetData")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Peer Address Validation (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestIsValidPeerAddress(t *testing.T) {
+	tests := []struct {
+		ip    string
+		port  uint16
+		valid bool
+		desc  string
+	}{
+		{"203.0.113.50", 9333, true, "valid public IPv4"},
+		{"2001:db8::1", 9333, true, "documentation IPv6 (not in private/loopback ranges)"},
+		{"127.0.0.1", 9333, false, "loopback IPv4"},
+		{"::1", 9333, false, "loopback IPv6"},
+		{"0.0.0.0", 9333, false, "unspecified IPv4"},
+		{"::", 9333, false, "unspecified IPv6"},
+		{"10.0.0.1", 9333, false, "private 10.0.0.0/8"},
+		{"172.16.0.1", 9333, false, "private 172.16.0.0/12"},
+		{"192.168.1.1", 9333, false, "private 192.168.0.0/16"},
+		{"169.254.1.1", 9333, false, "link-local"},
+		{"224.0.0.1", 9333, false, "multicast"},
+		{"203.0.113.50", 0, false, "port zero"},
+		{"not-an-ip", 9333, false, "invalid IP string"},
+		{"", 9333, false, "empty IP"},
+	}
+
+	for _, tt := range tests {
+		got := isValidPeerAddress(tt.ip, tt.port)
+		if got != tt.valid {
+			t.Errorf("isValidPeerAddress(%q, %d) = %v, want %v (%s)", tt.ip, tt.port, got, tt.valid, tt.desc)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Relay Deduplication (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestNode_RelayDeduplication(t *testing.T) {
+	n := &Node{
+		recentRelay: make(map[string]time.Time),
+	}
+
+	// First relay should succeed.
+	if !n.markRelayed("hash1") {
+		t.Error("first markRelayed() should return true")
+	}
+
+	// Second relay of same hash should be rejected.
+	if n.markRelayed("hash1") {
+		t.Error("duplicate markRelayed() should return false")
+	}
+
+	// Different hash should succeed.
+	if !n.markRelayed("hash2") {
+		t.Error("markRelayed() of different hash should return true")
+	}
+}
+
+func TestNode_CleanRecentRelay(t *testing.T) {
+	n := &Node{
+		recentRelay: make(map[string]time.Time),
+	}
+
+	// Add an old entry.
+	n.recentRelay["old_hash"] = time.Now().Add(-15 * time.Minute)
+	// Add a fresh entry.
+	n.recentRelay["new_hash"] = time.Now()
+
+	n.cleanRecentRelay()
+
+	if _, exists := n.recentRelay["old_hash"]; exists {
+		t.Error("old entry should have been cleaned up")
+	}
+	if _, exists := n.recentRelay["new_hash"]; !exists {
+		t.Error("fresh entry should still exist")
+	}
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Helper functions
 // ──────────────────────────────────────────────────────────────────────────────
@@ -389,7 +614,10 @@ func TestParsePort(t *testing.T) {
 }
 
 func TestReadMessage_FromRawBytes(t *testing.T) {
-	// Build a valid raw message.
+	// Build a valid raw message with checksum.
+	payloadData := []byte(`{"nonce":99}`)
+	checksum := payloadChecksum(payloadData)
+
 	var buf bytes.Buffer
 
 	// Magic.
@@ -402,10 +630,12 @@ func TestReadMessage_FromRawBytes(t *testing.T) {
 	buf.Write(cmd[:])
 
 	// Payload length.
-	payloadData := []byte(`{"nonce":99}`)
 	pLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(pLen, uint32(len(payloadData)))
 	buf.Write(pLen)
+
+	// Checksum (HIGH-2).
+	buf.Write(checksum[:])
 
 	// Payload.
 	buf.Write(payloadData)
@@ -425,5 +655,110 @@ func TestReadMessage_FromRawBytes(t *testing.T) {
 	}
 	if msg.Command != CmdPong {
 		t.Errorf("Command = %q, want %q", msg.Command, CmdPong)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Ban Score Constants (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestBanScoreConstants(t *testing.T) {
+	// Bad checksum should cause instant ban.
+	if BanScoreBadChecksum < MaxBanScore {
+		t.Errorf("BanScoreBadChecksum (%d) should be >= MaxBanScore (%d)", BanScoreBadChecksum, MaxBanScore)
+	}
+
+	// Other scores should be below instant ban.
+	if BanScoreInvalidPayload >= MaxBanScore {
+		t.Errorf("BanScoreInvalidPayload (%d) should be < MaxBanScore (%d)", BanScoreInvalidPayload, MaxBanScore)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Node ID duplicate detection (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestNode_RegisterNodeID(t *testing.T) {
+	n := &Node{
+		connectedNodeIDs: make(map[string]string),
+		peers:            make(map[string]*Peer),
+	}
+
+	s1, c1 := net.Pipe()
+	defer s1.Close()
+	defer c1.Close()
+
+	p1 := NewPeer(c1, false)
+	p1.NodeID = "node-abc"
+
+	// First registration should succeed.
+	if !n.registerNodeID(p1) {
+		t.Error("first registerNodeID() should succeed")
+	}
+
+	s2, c2 := net.Pipe()
+	defer s2.Close()
+	defer c2.Close()
+
+	p2 := NewPeer(c2, false)
+	p2.NodeID = "node-abc" // same nodeID, different connection
+
+	// Duplicate should be rejected.
+	if n.registerNodeID(p2) {
+		t.Error("duplicate registerNodeID() should fail")
+	}
+
+	s3, c3 := net.Pipe()
+	defer s3.Close()
+	defer c3.Close()
+
+	p3 := NewPeer(c3, false)
+	p3.NodeID = "node-xyz" // different nodeID
+
+	// Different nodeID should succeed.
+	if !n.registerNodeID(p3) {
+		t.Error("different nodeID registerNodeID() should succeed")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-peer limits constants (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestPerPeerLimits(t *testing.T) {
+	if MaxInvItems <= 0 {
+		t.Error("MaxInvItems must be positive")
+	}
+	if MaxAddrItems <= 0 {
+		t.Error("MaxAddrItems must be positive")
+	}
+	if MaxGetDataOutstanding <= 0 {
+		t.Error("MaxGetDataOutstanding must be positive")
+	}
+	if MaxRelayFanOut <= 0 {
+		t.Error("MaxRelayFanOut must be positive")
+	}
+	if PeerMaxMsgsPerWindow <= 0 {
+		t.Error("PeerMaxMsgsPerWindow must be positive")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Valid commands map (HIGH-2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestValidCommands(t *testing.T) {
+	expected := []string{
+		CmdVersion, CmdVerack, CmdPing, CmdPong,
+		CmdInv, CmdGetData, CmdTx, CmdBlock,
+		CmdGetBlocks, CmdAddr, CmdGetHeaders, CmdHeaders,
+	}
+	for _, cmd := range expected {
+		if !validCommands[cmd] {
+			t.Errorf("validCommands[%q] = false, want true", cmd)
+		}
+	}
+	if validCommands["badcmd"] {
+		t.Error("validCommands[badcmd] should be false")
 	}
 }
