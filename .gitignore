@@ -3,8 +3,6 @@ noda
 
 # Data files
 node_data.json
-*.json
-!go.mod
 
 # OS
 .DS_Store
@@ -18,3 +16,9 @@ Thumbs.db
 
 # Environment
 .env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
