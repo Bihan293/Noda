@@ -3,13 +3,20 @@
 //
 // CRITICAL-2: Transactions now use explicit UTXO inputs/outputs.
 // - POST /transaction accepts raw signed transactions with explicit inputs/outputs
-// - POST /send uses the wallet-level builder to auto-select UTXOs
-// - POST /sign signs a transaction using the wallet-level builder
+// - POST /tx/broadcast accepts raw signed transactions (production-safe alias)
 //
 // CRITICAL-3: Transactions are no longer confirmed instantly.
-// - POST /transaction and POST /send return status "pending" + txid
+// - POST /transaction and POST /tx/broadcast return status "pending" + txid
 // - Mining happens asynchronously via the miner service
 // - GET /status shows mining info (enabled, address, last mined block)
+//
+// CRITICAL-5: Private keys are no longer accepted over HTTP by default.
+// - POST /sign and POST /send are DISABLED in production (return 403).
+// - Set ALLOW_INSECURE_WALLET_HTTP=true (dev mode only) to re-enable them.
+// - The production endpoint for submitting transactions is POST /tx/broadcast
+//   which accepts only pre-signed raw transactions.
+// - Wallet operations (key generation, tx building, signing) are done offline
+//   via the CLI: `noda wallet new`, `noda wallet build-tx`, `noda wallet sign-tx`.
 package api
 
 import (
@@ -32,11 +39,12 @@ import (
 
 // Server wraps the ledger and network layer to serve HTTP requests.
 type Server struct {
-	Ledger      *ledger.Ledger
-	Network     *network.Network
-	Port        string
-	RateLimiter *ratelimit.Limiter
-	Miner       *miner.Miner // CRITICAL-3: background miner reference
+	Ledger               *ledger.Ledger
+	Network              *network.Network
+	Port                 string
+	RateLimiter          *ratelimit.Limiter
+	Miner                *miner.Miner // CRITICAL-3: background miner reference
+	AllowInsecureWallet  bool         // CRITICAL-5: if false, /sign and /send are disabled
 }
 
 // ---------- Helpers ----------
@@ -157,7 +165,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"node":    "noda",
-		"version": "0.8.0",
+		"version": "0.9.0",
 	})
 }
 
@@ -326,7 +334,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ch := s.Ledger.GetChain()
 	resp := map[string]interface{}{
 		"port":                  s.Port,
-		"version":               "0.8.0",
+		"version":               "0.9.0",
 		"tx_model":              "utxo_inputs_outputs",
 		"chain_selection":       "cumulative_work",
 		"block_height":          ch.Height(),
@@ -345,6 +353,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"genesis_owner":         s.Ledger.GenesisOwner(),
 		"faucet_owner_match":    s.Ledger.FaucetOwnerMatch(),
 		"usable_faucet_balance": s.Ledger.UsableFaucetBalance(),
+		"insecure_wallet_http":  s.AllowInsecureWallet,
 	}
 
 	// Block index info (CRITICAL-4).
@@ -388,14 +397,34 @@ func (s *Server) handleMempool(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// insecureEndpointBlocked returns true (and writes a 403 response) if insecure
+// wallet endpoints are disabled. Used by /sign and /send.
+func (s *Server) insecureEndpointBlocked(w http.ResponseWriter, endpoint string) bool {
+	if s.AllowInsecureWallet {
+		return false
+	}
+	errorResponse(w, http.StatusForbidden,
+		fmt.Sprintf("%s is disabled in production mode. "+
+			"Use the offline CLI (noda wallet sign-tx / build-tx) to sign transactions locally, "+
+			"then broadcast via POST /tx/broadcast. "+
+			"Set ALLOW_INSECURE_WALLET_HTTP=true to enable this endpoint (dev/test only).", endpoint))
+	return true
+}
+
 // handleSign signs a transaction using the wallet builder and returns it without broadcasting.
 // POST /sign — body: {from, to, amount, private_key}
+// CRITICAL-5: Disabled by default in production. Requires AllowInsecureWallet=true.
 func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
 
+	// CRITICAL-5: Block this endpoint in production.
+	if s.insecureEndpointBlocked(w, "POST /sign") {
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	var req SendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -441,20 +470,27 @@ func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Debug("TX signed", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
+	slog.Debug("TX signed (insecure mode)", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"transaction": tx,
 		"txid":        tx.ID,
+		"warning":     "This endpoint accepts private keys over HTTP. Use offline signing in production.",
 	})
 }
 
 // handleSend is the all-in-one endpoint: build + sign + validate + mempool + broadcast.
 // POST /send — body: {from, to, amount, private_key}
 // CRITICAL-3: Returns status "pending" — tx goes to mempool, NOT confirmed instantly.
+// CRITICAL-5: Disabled by default in production. Requires AllowInsecureWallet=true.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+
+	// CRITICAL-5: Block this endpoint in production.
+	if s.insecureEndpointBlocked(w, "POST /send") {
 		return
 	}
 
@@ -503,7 +539,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Processing send", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
+	slog.Info("Processing send (insecure mode)", "from", shortAddr(from), "to", shortAddr(req.To), "amount", req.Amount)
 
 	if err := s.Ledger.SubmitTransaction(*tx); err != nil {
 		m.TxRejected.Inc()
@@ -523,6 +559,58 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		"from":          from,
 		"to":            req.To,
 		"amount":        req.Amount,
+		"status":        "pending",
+		"confirmations": 0,
+		"warning":       "This endpoint accepts private keys over HTTP. Use offline signing in production.",
+	})
+}
+
+// handleBroadcastRawTx is the production-safe endpoint for submitting pre-signed
+// raw transactions. It does NOT accept private keys — only fully formed signed
+// transactions with explicit inputs/outputs.
+// POST /tx/broadcast — body: {version, inputs, outputs, lock_time}
+// CRITICAL-5: This is the recommended production endpoint for transaction submission.
+func (s *Server) handleBroadcastRawTx(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	var req RawTransactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Warn("TX broadcast decode failed", "error", err)
+		errorResponse(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	// Build the transaction.
+	tx := block.Transaction{
+		Version:      req.Version,
+		Inputs:       req.Inputs,
+		Outputs:      req.Outputs,
+		LockTime:     req.LockTime,
+		CoinbaseData: req.CoinbaseData,
+	}
+	tx.ID = block.HashTransaction(&tx)
+
+	slog.Info("TX broadcast received", "inputs", len(tx.Inputs), "outputs", len(tx.Outputs))
+
+	if err := s.Ledger.SubmitTransaction(tx); err != nil {
+		m.TxRejected.Inc()
+		errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	m.TxAccepted.Inc()
+	s.updateMetrics()
+
+	// Broadcast the valid transaction to all peers.
+	go s.Network.BroadcastTransaction(tx)
+
+	jsonResponse(w, http.StatusCreated, map[string]interface{}{
+		"message":       "transaction accepted",
+		"txid":          tx.ID,
 		"status":        "pending",
 		"confirmations": 0,
 	})
@@ -613,10 +701,13 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/transaction", s.handleTransaction)
 	mux.HandleFunc("/chain", s.handleChain)
 
-	// Convenience endpoints
+	// Convenience endpoints (CRITICAL-5: /sign and /send gated by AllowInsecureWallet)
 	mux.HandleFunc("/sign", s.handleSign)
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/faucet", s.handleFaucet)
+
+	// Production endpoint for raw signed transactions (CRITICAL-5)
+	mux.HandleFunc("/tx/broadcast", s.handleBroadcastRawTx)
 
 	// Utility endpoints
 	mux.HandleFunc("/generate-keys", s.handleGenerateKeys)
@@ -655,9 +746,15 @@ func (s *Server) Start(ctx context.Context) error {
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
+	insecureMode := "disabled"
+	if s.AllowInsecureWallet {
+		insecureMode = "ENABLED (dev mode — /sign and /send accept private keys)"
+	}
+
 	slog.Info("Noda Node listening",
 		"address", "http://0.0.0.0"+addr,
-		"endpoints", "/health /metrics /balance /transaction /chain /sign /send /faucet /generate-keys /status /mempool /peers /sync",
+		"endpoints", "/health /metrics /balance /transaction /tx/broadcast /chain /sign /send /faucet /generate-keys /status /mempool /peers /sync",
+		"insecure_wallet", insecureMode,
 	)
 
 	// Graceful shutdown.

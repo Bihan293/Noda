@@ -12,15 +12,31 @@ import (
 	"github.com/Bihan293/Noda/network"
 )
 
+// newTestServer creates a test server with insecure wallet DISABLED (production mode).
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	l := ledger.NewLedger(dir + "/test.json")
 	n := network.NewNetwork(nil)
 	return &Server{
-		Ledger:  l,
-		Network: n,
-		Port:    "0",
+		Ledger:              l,
+		Network:             n,
+		Port:                "0",
+		AllowInsecureWallet: false, // CRITICAL-5: production mode by default
+	}
+}
+
+// newTestServerInsecure creates a test server with insecure wallet ENABLED (dev mode).
+func newTestServerInsecure(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	l := ledger.NewLedger(dir + "/test.json")
+	n := network.NewNetwork(nil)
+	return &Server{
+		Ledger:              l,
+		Network:             n,
+		Port:                "0",
+		AllowInsecureWallet: true, // dev mode
 	}
 }
 
@@ -183,6 +199,13 @@ func TestHandleStatus(t *testing.T) {
 	if _, ok := resp["usable_faucet_balance"]; !ok {
 		t.Error("response should contain 'usable_faucet_balance'")
 	}
+	// [CRITICAL-5] insecure_wallet_http field.
+	if _, ok := resp["insecure_wallet_http"]; !ok {
+		t.Error("response should contain 'insecure_wallet_http'")
+	}
+	if resp["insecure_wallet_http"].(bool) != false {
+		t.Error("insecure_wallet_http should be false in production mode")
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -290,11 +313,54 @@ func TestHandleTransaction_WrongMethod(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// POST /sign
+// CRITICAL-5: POST /sign — disabled by default in production
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestHandleSign_MissingPrivateKey(t *testing.T) {
-	s := newTestServer(t)
+func TestHandleSign_DisabledByDefault(t *testing.T) {
+	s := newTestServer(t) // production mode
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"to":          "aabbccdd",
+		"amount":      10,
+		"private_key": "aabb",
+	})
+	req := httptest.NewRequest("POST", "/sign", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleSign(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (should be forbidden in production)", w.Code, http.StatusForbidden)
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] == "" {
+		t.Error("response should contain an error explaining the endpoint is disabled")
+	}
+}
+
+func TestHandleSign_WorksInDevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"to":          "aabbccdd",
+		"amount":      10,
+		"private_key": "aabb", // invalid key, but we expect 400 not 403
+	})
+	req := httptest.NewRequest("POST", "/sign", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleSign(w, req)
+
+	// Should get 400 (bad request due to invalid key), NOT 403.
+	if w.Code == http.StatusForbidden {
+		t.Error("status should NOT be 403 in dev mode")
+	}
+}
+
+func TestHandleSign_MissingPrivateKey_DevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"to":     "some_addr",
@@ -310,8 +376,8 @@ func TestHandleSign_MissingPrivateKey(t *testing.T) {
 	}
 }
 
-func TestHandleSign_MissingTo(t *testing.T) {
-	s := newTestServer(t)
+func TestHandleSign_MissingTo_DevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"amount":      10,
@@ -327,8 +393,8 @@ func TestHandleSign_MissingTo(t *testing.T) {
 	}
 }
 
-func TestHandleSign_NegativeAmount(t *testing.T) {
-	s := newTestServer(t)
+func TestHandleSign_NegativeAmount_DevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"to":          "addr",
@@ -346,11 +412,54 @@ func TestHandleSign_NegativeAmount(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// POST /send (validation errors)
+// CRITICAL-5: POST /send — disabled by default in production
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestHandleSend_MissingPrivateKey(t *testing.T) {
-	s := newTestServer(t)
+func TestHandleSend_DisabledByDefault(t *testing.T) {
+	s := newTestServer(t) // production mode
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"to":          "aabbccdd",
+		"amount":      10,
+		"private_key": "aabb",
+	})
+	req := httptest.NewRequest("POST", "/send", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleSend(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (should be forbidden in production)", w.Code, http.StatusForbidden)
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] == "" {
+		t.Error("response should contain an error explaining the endpoint is disabled")
+	}
+}
+
+func TestHandleSend_WorksInDevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"to":          "aabbccdd",
+		"amount":      10,
+		"private_key": "aabb", // invalid key, but we expect 400 not 403
+	})
+	req := httptest.NewRequest("POST", "/send", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleSend(w, req)
+
+	// Should get 400 (bad request due to invalid key), NOT 403.
+	if w.Code == http.StatusForbidden {
+		t.Error("status should NOT be 403 in dev mode")
+	}
+}
+
+func TestHandleSend_MissingPrivateKey_DevMode(t *testing.T) {
+	s := newTestServerInsecure(t) // dev mode
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"to":     "addr",
@@ -363,6 +472,60 @@ func TestHandleSend_MissingPrivateKey(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CRITICAL-5: POST /tx/broadcast — always enabled (production endpoint)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestHandleBroadcastRawTx_InvalidJSON(t *testing.T) {
+	s := newTestServer(t) // production mode
+
+	req := httptest.NewRequest("POST", "/tx/broadcast", bytes.NewReader([]byte("not json")))
+	w := httptest.NewRecorder()
+
+	s.handleBroadcastRawTx(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleBroadcastRawTx_WrongMethod(t *testing.T) {
+	s := newTestServer(t)
+
+	req := httptest.NewRequest("GET", "/tx/broadcast", nil)
+	w := httptest.NewRecorder()
+
+	s.handleBroadcastRawTx(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestHandleBroadcastRawTx_AlwaysEnabled(t *testing.T) {
+	// /tx/broadcast should work in production mode (no private keys involved).
+	s := newTestServer(t) // production mode
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"version": 1,
+		"inputs":  []interface{}{},
+		"outputs": []interface{}{},
+	})
+	req := httptest.NewRequest("POST", "/tx/broadcast", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	s.handleBroadcastRawTx(w, req)
+
+	// Should NOT be 403 — the endpoint accepts raw signed transactions.
+	if w.Code == http.StatusForbidden {
+		t.Error("/tx/broadcast should NOT return 403 in production mode")
+	}
+	// Should be 400 because the tx has no inputs/outputs (invalid tx).
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (invalid tx)", w.Code, http.StatusBadRequest)
 	}
 }
 

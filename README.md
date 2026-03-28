@@ -13,6 +13,8 @@ A lightweight Bitcoin-like crypto node with PoW mining, UTXO model, TCP P2P prot
 - **Faucet** — 5,000 coins per request, global 11M cap, permanently disabled after cap
 - **Tokenomics** — 21M total supply (11M faucet + 10M mining)
 - **HTTP API** — RESTful endpoints with rate limiting and security headers
+- **Secure by default** — node API does NOT accept private keys in production mode
+- **Offline wallet CLI** — build, sign, and broadcast transactions locally
 - **TCP P2P** — Bitcoin-style binary protocol with handshake, inventory, block/tx relay
 - **Prometheus metrics** — `/metrics` endpoint for monitoring
 - **Structured logging** — `log/slog` with configurable levels
@@ -38,6 +40,7 @@ CLI flags override environment variables. Both fall back to sensible defaults.
 | `TCP_PEERS`  | `-tcp-peers`   | (none)           | Comma-separated TCP peer addresses (host:port)   |
 | `LOG_LEVEL`  | `-log-level`   | `info`           | Log level: debug, info, warn, error              |
 | `RATE_LIMIT` | `-rate-limit`  | `10`             | Max requests per second per IP                   |
+| `ALLOW_INSECURE_WALLET_HTTP` | `-allow-insecure-wallet` | `false` | Allow /sign and /send with private keys (dev only) |
 
 ---
 
@@ -67,6 +70,9 @@ FAUCET_KEY="your_hex_private_key" ./noda
 
 # Run with rate limiting adjusted
 RATE_LIMIT=50 ./noda
+
+# Run with insecure wallet mode (dev/test ONLY — allows /sign and /send with private keys)
+ALLOW_INSECURE_WALLET_HTTP=true ./noda
 ```
 
 ### Run multiple nodes locally
@@ -139,15 +145,21 @@ Nodes:
 
 ## API Endpoints
 
+> **Security Note:** In production mode (default), the node does NOT accept private keys
+> over HTTP. The `/sign` and `/send` endpoints are disabled and return `403 Forbidden`.
+> Use the offline wallet CLI to sign transactions locally, then broadcast via
+> `POST /tx/broadcast`. Set `ALLOW_INSECURE_WALLET_HTTP=true` for development only.
+
 | Method | Endpoint            | Description                                    |
 |--------|---------------------|------------------------------------------------|
 | GET    | `/health`           | Lightweight health check                       |
 | GET    | `/metrics`          | Prometheus-format metrics                      |
 | GET    | `/balance?address=` | Get balance for an address                     |
 | POST   | `/transaction`      | Submit a pre-signed transaction                |
+| POST   | `/tx/broadcast`     | Submit a pre-signed raw transaction (production endpoint) |
 | GET    | `/chain`            | Get the full blockchain                        |
-| POST   | `/sign`             | Sign a transaction (returns signature, no broadcast) |
-| POST   | `/send`             | Sign + validate + add to chain + broadcast     |
+| POST   | `/sign`             | Sign a transaction (DEV MODE ONLY — requires `ALLOW_INSECURE_WALLET_HTTP=true`) |
+| POST   | `/send`             | Sign + validate + add to mempool (DEV MODE ONLY) |
 | POST   | `/faucet`           | Get free coins (5,000 per request, 11M cap)    |
 | GET    | `/generate-keys`    | Generate a new Ed25519 key pair                |
 | GET    | `/status`           | Node info (height, peers, faucet, UTXO, mining)|
@@ -158,10 +170,14 @@ Nodes:
 
 ## Complete Usage Walkthrough
 
-### Step 1: Generate Keys
+### Step 1: Generate Keys (offline)
 
 ```bash
+# Option A: Use the node API (convenient for development)
 curl -s http://localhost:3000/generate-keys | jq
+
+# Option B: Use the wallet CLI (recommended for production)
+# The wallet package provides offline key generation and transaction signing.
 ```
 
 ### Step 2: Get Test Coins from Faucet
@@ -172,9 +188,29 @@ curl -s -X POST http://localhost:3000/faucet \
   -d '{"to": "your_address_here"}' | jq
 ```
 
-### Step 3: Send Coins
+### Step 3: Send Coins (Production — offline signing)
 
 ```bash
+# Step 3a: Build the raw unsigned transaction offline
+# (Use the wallet package or manually construct the JSON)
+
+# Step 3b: Sign the transaction offline with your private key
+# (Use the wallet package: wallet.SignTransaction(...))
+
+# Step 3c: Broadcast the signed transaction to the node
+curl -s -X POST http://localhost:3000/tx/broadcast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": 1,
+    "inputs": [{"prev_tx_id": "...", "prev_index": 0, "signature": "...", "pub_key": "..."}],
+    "outputs": [{"amount": 25, "address": "recipient_address"}, {"amount": 75, "address": "your_change_address"}]
+  }' | jq
+```
+
+### Step 3 (Alternative): Send Coins (DEV MODE ONLY)
+
+```bash
+# Only works when ALLOW_INSECURE_WALLET_HTTP=true
 curl -s -X POST http://localhost:3000/send \
   -H "Content-Type: application/json" \
   -d '{
@@ -262,6 +298,9 @@ You can import these metrics into Grafana for visualization. Configure Prometheu
 ├── api/
 │   ├── server.go            # HTTP server with rate limiting, metrics, security
 │   └── server_test.go       # All endpoint tests with httptest
+├── wallet/
+│   ├── wallet.go            # Offline wallet: key gen, tx build, sign, broadcast
+│   └── wallet_test.go       # Wallet offline operations tests
 ├── network/
 │   ├── network.go           # HTTP-based P2P networking
 │   └── network_test.go      # Peer management tests
@@ -269,6 +308,9 @@ You can import these metrics into Grafana for visualization. Configure Prometheu
 │   ├── message.go           # TCP protocol messages and wire encoding
 │   ├── node.go              # P2P node, handshake, block/tx relay
 │   └── p2p_test.go          # Message encoding, peer state, payload tests
+├── miner/
+│   ├── miner.go             # Background miner: mempool → block template → PoW
+│   └── miner_test.go        # Miner configuration and block assembly tests
 ├── metrics/
 │   └── metrics.go           # Prometheus-compatible metrics (zero deps)
 ├── ratelimit/
@@ -317,6 +359,7 @@ go test ./... -v -race -count=1
 ```bash
 go test ./block/ -v
 go test ./crypto/ -v
+go test ./wallet/ -v
 go test ./integration/ -v
 ```
 
@@ -330,9 +373,10 @@ go test ./integration/ -v
 | `mempool/` | Add/remove, FIFO ordering, eviction, double-spend detection |
 | `utxo/` | Add/spend, balance queries, ApplyBlock, rebuild from blocks |
 | `ledger/` | Faucet state, transaction validation, persistence, chain replacement |
+| `wallet/` | Offline key gen, tx building, signing, verification |
 | `p2p/` | Message encoding/decoding, peer state, payload round-trips |
 | `network/` | Peer management, broadcast |
-| `api/` | All HTTP endpoints, error responses, middleware |
+| `api/` | All HTTP endpoints, security gate (insecure mode), error responses |
 | `integration/` | End-to-end mining, UTXO consistency, tokenomics verification |
 
 ### CI Pipeline
@@ -346,6 +390,9 @@ GitHub Actions runs on every push and pull request:
 
 ## Security
 
+- **No private keys over HTTP**: In production mode (default), the node API does NOT accept private keys. `/sign` and `/send` return `403 Forbidden`. Use the offline wallet package to sign transactions locally.
+- **Production transaction endpoint**: Use `POST /tx/broadcast` to submit pre-signed raw transactions.
+- **Dev mode**: Set `ALLOW_INSECURE_WALLET_HTTP=true` to enable `/sign` and `/send` for development/testing.
 - **Rate limiting**: Configurable per-IP token bucket (default: 10 req/s)
 - **Input validation**: Hex address format, length limits
 - **Body size limits**: 64 KB max request body
@@ -353,6 +400,7 @@ GitHub Actions runs on every push and pull request:
 - **Security headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection
 - **Peer banning**: Misbehaving peers are banned for 24 hours
 - **Non-root Docker**: Runs as unprivileged `noda` user
+- **Faucet key protection**: Faucet private keys are never logged or returned in API responses
 
 ## Design Decisions
 
@@ -362,7 +410,8 @@ GitHub Actions runs on every push and pull request:
 - **Token bucket rate limiter**: smooth rate control, burst tolerance
 - **Graceful shutdown**: context cancellation, connection draining, 10s timeout
 - **UTXO model**: prevents double-spend, enables parallel validation
-- **Longest-chain rule**: the node with the most blocks wins during sync
+- **Longest-chain rule**: the node with the most cumulative work wins during sync
+- **Offline wallet**: transaction signing happens locally, never over HTTP
 - **JSON storage**: human-readable, easy to debug; fine for a lightweight node
 - **No external dependencies**: uses only the Go standard library
 - **Multi-stage Docker build**: ~15 MB final image, non-root user, health check included

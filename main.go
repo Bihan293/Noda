@@ -37,6 +37,7 @@
 //	BLOCK_MAX_TX       — max transactions per block           (default: 100)
 //	MINING_INTERVAL_MS — interval between mining attempts ms  (default: 5000)
 //	MINING_MAX_ATTEMPTS — max PoW nonce attempts per block    (default: 10000000)
+//	ALLOW_INSECURE_WALLET_HTTP — allow /sign and /send with private keys (default: false)
 package main
 
 import (
@@ -89,6 +90,9 @@ func main() {
 	defaultMiningInterval := envOrDefault("MINING_INTERVAL_MS", "5000")
 	defaultMiningMaxAttempts := envOrDefault("MINING_MAX_ATTEMPTS", "10000000")
 
+	// CRITICAL-5: Insecure wallet mode (default: disabled).
+	defaultAllowInsecure := envOrDefault("ALLOW_INSECURE_WALLET_HTTP", "false")
+
 	// ---- CLI Flags (override env vars) ----
 	port := flag.String("port", defaultPort, "HTTP port for this node (env: PORT)")
 	p2pPort := flag.String("p2p-port", defaultP2PPort, "TCP P2P port for this node (env: P2P_PORT)")
@@ -105,6 +109,9 @@ func main() {
 	blockMaxTxFlag := flag.String("block-max-tx", defaultBlockMaxTx, "Max transactions per block (env: BLOCK_MAX_TX)")
 	miningIntervalFlag := flag.String("mining-interval", defaultMiningInterval, "Mining attempt interval in ms (env: MINING_INTERVAL_MS)")
 	miningMaxAttemptsFlag := flag.String("mining-max-attempts", defaultMiningMaxAttempts, "Max PoW nonce attempts (env: MINING_MAX_ATTEMPTS)")
+
+	// CRITICAL-5: Insecure wallet flag.
+	allowInsecureFlag := flag.String("allow-insecure-wallet", defaultAllowInsecure, "Allow /sign and /send with private keys (env: ALLOW_INSECURE_WALLET_HTTP)")
 
 	flag.Parse()
 
@@ -158,7 +165,7 @@ func main() {
 
 	// ---- Initialize components ----
 	slog.Info("╔══════════════════════════════════════════════════════════════╗")
-	slog.Info("║         Noda Crypto Node — Bitcoin-like v0.8.0             ║")
+	slog.Info("║         Noda Crypto Node — Bitcoin-like v0.9.0             ║")
 	slog.Info("║  UTXO I/O + Mempool + Miner + Fees + CumWork + TCP P2P   ║")
 	slog.Info("╚══════════════════════════════════════════════════════════════╝")
 	slog.Info("Configuration",
@@ -169,6 +176,7 @@ func main() {
 		"rate_limit", ratePerSec,
 		"http_peers", httpPeers,
 		"tcp_peers", tcpPeers,
+		"insecure_wallet", *allowInsecureFlag,
 	)
 
 	// Load or create ledger (chain + UTXO + mempool).
@@ -314,13 +322,23 @@ func main() {
 	// ---- Start Background Miner (CRITICAL-3) ----
 	go minerWorker.Run(ctx)
 
+	// Parse insecure wallet mode (CRITICAL-5).
+	allowInsecureWallet := false
+	switch strings.ToLower(*allowInsecureFlag) {
+	case "true", "1", "yes":
+		allowInsecureWallet = true
+		slog.Warn("INSECURE WALLET MODE ENABLED — /sign and /send accept private keys over HTTP")
+		slog.Warn("This mode is for development/testing ONLY. Do NOT use in production!")
+	}
+
 	// ---- Start HTTP server ----
 	server := &api.Server{
-		Ledger:      l,
-		Network:     net,
-		Port:        *port,
-		RateLimiter: limiter,
-		Miner:       minerWorker,
+		Ledger:              l,
+		Network:             net,
+		Port:                *port,
+		RateLimiter:         limiter,
+		Miner:               minerWorker,
+		AllowInsecureWallet: allowInsecureWallet,
 	}
 
 	slog.Info("Starting HTTP server", "port", *port)
