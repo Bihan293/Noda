@@ -9,8 +9,8 @@
 //   - Mempool for unconfirmed transaction management
 //   - Background miner: block template assembly from mempool + PoW (CRITICAL-3)
 //   - Transaction fees: sum(inputs) - sum(outputs), collected by miner (CRITICAL-3)
-//   - Faucet: 5,000 coins per request, global cap 11,000,000 (no per-address cooldown)
-//   - Mining rewards up to 10,000,000 (total supply cap: 21,000,000)
+//   - Faucet: 100 coins per request, global cap 1,000,000 (no per-address cooldown)
+//   - Mining rewards up to 20,000,000 (total supply cap: 21,000,000)
 //   - Ed25519 cryptography for transaction signing
 //   - HTTP API for wallet interactions with rate limiting
 //   - Prometheus-compatible /metrics endpoint
@@ -165,7 +165,7 @@ func main() {
 
 	// ---- Initialize components ----
 	slog.Info("╔══════════════════════════════════════════════════════════════╗")
-	slog.Info("║         Noda Crypto Node — Bitcoin-like v0.9.0             ║")
+	slog.Info("║         Noda Crypto Node — Bitcoin-like v1.0.0             ║")
 	slog.Info("║  UTXO I/O + Mempool + Miner + Fees + CumWork + TCP P2P   ║")
 	slog.Info("╚══════════════════════════════════════════════════════════════╝")
 	slog.Info("Configuration",

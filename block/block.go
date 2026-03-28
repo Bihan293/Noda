@@ -10,11 +10,11 @@
 //   - Signatures cover the sighash of inputs + outputs.
 //
 // Tokenomics:
-//   - Genesis supply: 11,000,000 coins (distributed via faucet)
+//   - Genesis supply: 1,000,000 coins (distributed via faucet)
 //   - Initial block reward: 50 coins
 //   - Halving interval: every 210,000 blocks
-//   - Max mining supply: 10,000,000 coins
-//   - Max total supply: 21,000,000 coins (11M faucet + 10M mining)
+//   - Max mining supply: 20,000,000 coins
+//   - Max total supply: 21,000,000 coins (1M faucet + 20M mining)
 //   - Difficulty adjustment: every 2016 blocks, target 10 min/block
 package block
 
@@ -34,13 +34,13 @@ import (
 
 const (
 	// GenesisSupply is the total supply minted at genesis (distributed via faucet).
-	GenesisSupply float64 = 11_000_000
+	GenesisSupply float64 = 1_000_000
 
 	// MaxTotalSupply is the absolute maximum coins that can ever exist.
 	MaxTotalSupply float64 = 21_000_000
 
 	// MaxMiningSupply is the maximum coins that can be created through mining.
-	MaxMiningSupply float64 = 10_000_000
+	MaxMiningSupply float64 = 20_000_000
 
 	// InitialBlockReward is the coinbase reward for the first era.
 	InitialBlockReward float64 = 50.0

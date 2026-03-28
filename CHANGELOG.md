@@ -4,6 +4,16 @@ All notable changes to Noda are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.0] — 2026-03-28
+
+### Changed
+- **Tokenomics rebalance** — improved coin distribution for a healthier economy
+  - Faucet amount reduced: 5,000 → 100 coins per request (more gradual distribution)
+  - Genesis/faucet supply reduced: 11,000,000 → 1,000,000 coins (less pre-mined)
+  - Mining supply increased: 10,000,000 → 20,000,000 coins (more rewards for miners)
+  - Total supply remains 21,000,000 (1M faucet + 20M mining)
+  - All tests and documentation updated to match new tokenomics
+
 ## [0.9.1] — 2026-03-28
 
 ### Added
@@ -17,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Competing branches + reorg test with UTXO consistency verification
   - Multi-node sync after divergence test
   - Faucet bootstrap and exhaust simulation test
-  - Mining reward clamping at 10M cap test
+  - Mining reward clamping at 20M cap test
 - **Enhanced CI pipeline** — GitHub Actions now includes:
   - Fuzz tests for block and P2P packages
   - All invariant/property tests run with race detector
@@ -91,7 +101,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Mempool (`mempool/` package) — in-memory pool of unconfirmed transactions
 - UTXO set (`utxo/` package) — unspent transaction output tracking
-- Faucet global cap enforcement: 5,000 coins/request, total cap 11,000,000
+- Faucet global cap enforcement: 100 coins/request, total cap 1,000,000
 - Per-address cooldown removed; replaced by global cap logic
 
 ## [0.2.0] — 2026-03-27

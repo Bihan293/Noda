@@ -10,8 +10,8 @@ A lightweight Bitcoin-like crypto node with PoW mining, UTXO model, TCP P2P prot
 - **Block reward halving** — 50 coins initial, halving every 210,000 blocks
 - **UTXO model** — unspent transaction output tracking for balance integrity
 - **Mempool** — in-memory unconfirmed transaction pool with eviction
-- **Faucet** — 5,000 coins per request, global 11M cap, permanently disabled after cap
-- **Tokenomics** — 21M total supply (11M faucet + 10M mining)
+- **Faucet** — 100 coins per request, global 1M cap, permanently disabled after cap
+- **Tokenomics** — 21M total supply (1M faucet + 20M mining)
 - **HTTP API** — RESTful endpoints with rate limiting and security headers
 - **Secure by default** — node API does NOT accept private keys in production mode
 - **Offline wallet CLI** — build, sign, and broadcast transactions locally
@@ -160,7 +160,7 @@ Nodes:
 | GET    | `/chain`            | Get the full blockchain                        |
 | POST   | `/sign`             | Sign a transaction (DEV MODE ONLY — requires `ALLOW_INSECURE_WALLET_HTTP=true`) |
 | POST   | `/send`             | Sign + validate + add to mempool (DEV MODE ONLY) |
-| POST   | `/faucet`           | Get free coins (5,000 per request, 11M cap)    |
+| POST   | `/faucet`           | Get free coins (100 per request, 1M cap)       |
 | GET    | `/generate-keys`    | Generate a new Ed25519 key pair                |
 | GET    | `/status`           | Node info (height, peers, faucet, UTXO, mining)|
 | GET    | `/mempool`          | View pending transactions                      |
@@ -250,12 +250,12 @@ The `/metrics` endpoint exposes metrics in Prometheus text exposition format:
 noda_block_height 42
 noda_block_count 43
 noda_total_mined_coins 2100
-noda_total_faucet_coins 50000
+noda_total_faucet_coins 1000
 noda_block_reward 50
 noda_mempool_size 3
 noda_utxo_count 128
 noda_peer_count_total 5
-noda_faucet_remaining_coins 1.095e+07
+noda_faucet_remaining_coins 9.99e+05
 noda_faucet_active 1
 noda_http_requests_total 1234
 noda_tx_accepted_total 42
@@ -330,17 +330,17 @@ You can import these metrics into Grafana for visualization. Configure Prometheu
 ## Tokenomics
 
 ```
-Genesis Supply:           11,000,000 coins (minted at genesis)
-Faucet Distribution:      5,000 coins per request
+Genesis Supply:           1,000,000 coins (minted at genesis)
+Faucet Distribution:      100 coins per request
   - Any address can claim (multiple times)
-  - Global cap: 11,000,000 total coins via faucet
-  - Once 11M distributed → faucet permanently disabled
+  - Global cap: 1,000,000 total coins via faucet
+  - Once 1M distributed → faucet permanently disabled
 Mining Rewards:           Starts at 50 coins/block
   - Halving every 210,000 blocks
   - Mining continues until total supply reaches 21,000,000
 Max Total Supply:         21,000,000 coins
-  - 11,000,000 from faucet (genesis)
-  - 10,000,000 from mining rewards
+  - 1,000,000 from faucet (genesis)
+  - 20,000,000 from mining rewards
 Difficulty Adjustment:    Every 2,016 blocks (target: ~10 min/block)
 ```
 
@@ -395,9 +395,9 @@ GitHub Actions runs on every push and pull request:
 |---|---|
 | `sum(UTXO) == genesis_supply + total_mined` | No coins are created or destroyed outside of coinbase/genesis |
 | `total_supply <= 21,000,000` | Max supply is never exceeded |
-| `faucet_distributed <= 11,000,000` | Faucet cap is enforced |
+| `faucet_distributed <= 1,000,000` | Faucet cap is enforced |
 | `no double-spend in main chain` | Each outpoint is spent at most once |
-| `mining_rewards <= 10,000,000` | Mining reward cap is enforced |
+| `mining_rewards <= 20,000,000` | Mining reward cap is enforced |
 
 ### Fuzz Tests
 

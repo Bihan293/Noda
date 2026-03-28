@@ -21,9 +21,9 @@ Noda is a minimal cryptocurrency node with:
 | Block Reward | None | 50 coins, halving every 210,000 blocks |
 | Mempool | None | In-memory pending TX pool |
 | UTXO Model | Account-based balances | UTXO set with inputs/outputs |
-| Faucet | 50 coins/req, per-address cooldown | 5,000 coins/req, global cap 11M total |
+| Faucet | 50 coins/req, per-address cooldown | 100 coins/req, global cap 1M total |
 | P2P Protocol | HTTP REST | TCP binary protocol (Bitcoin-style) |
-| Total Supply | 11M (genesis only) | 21M (11M faucet + 10M mining) |
+| Total Supply | 1M (genesis only) | 21M (1M faucet + 20M mining) |
 | Mining | None | PoW mining with coinbase TX |
 | Tests | None | Full test suite + CI |
 | Production | Basic logging | slog, Prometheus, graceful shutdown |
@@ -33,17 +33,17 @@ Noda is a minimal cryptocurrency node with:
 ## Tokenomics (STRICT)
 
 ```
-Genesis Supply:           11,000,000 coins (minted at genesis, held by genesis address)
-Faucet Distribution:      5,000 coins per request
+Genesis Supply:           1,000,000 coins (minted at genesis, held by genesis address)
+Faucet Distribution:      100 coins per request
   - Any address can claim (multiple addresses, many times)
-  - Global cap: 11,000,000 total coins distributed via faucet
-  - Once 11M distributed → faucet permanently disabled for ALL addresses
+  - Global cap: 1,000,000 total coins distributed via faucet
+  - Once 1M distributed → faucet permanently disabled for ALL addresses
 Mining Rewards:           Starts at 50 coins/block
   - Halving every 210,000 blocks
   - Mining continues until total supply reaches 21,000,000
 Max Total Supply:         21,000,000 coins
-  - 11,000,000 from faucet (genesis)
-  - 10,000,000 from mining rewards
+  - 1,000,000 from faucet (genesis)
+  - 20,000,000 from mining rewards
 Difficulty Adjustment:    Every 2016 blocks (target: ~10 min/block)
 ```
 
@@ -64,14 +64,14 @@ Difficulty Adjustment:    Every 2016 blocks (target: ~10 min/block)
   - Dynamic difficulty adjustment (recalculate every 2016 blocks, target 10 min/block)
   - Block reward with halving: 50 coins initial, halving every 210,000 blocks
   - Coinbase transaction generation (mining reward)
-- [ ] Genesis block (not just genesis TX) containing the 11M supply transaction
+- [ ] Genesis block (not just genesis TX) containing the 1M supply transaction
 - [ ] Block validation (PoW check, Merkle root verification, hash chain integrity)
 - [ ] Update `chain/` to store blocks instead of flat transactions
-- [ ] Faucet amount updated from 50 → 5,000 coins per request
+- [ ] Faucet amount updated from 50 → 100 coins per request
 
 ### Stage 2: Mempool + UTXO + Faucet Global Cap [CRITICAL-3]
 
-**Goal:** Add transaction pool and UTXO model; enforce faucet's 11M global limit.
+**Goal:** Add transaction pool and UTXO model; enforce faucet's 1M global limit.
 
 **Deliverables:**
 - [ ] New `mempool/` package:
@@ -88,9 +88,9 @@ Difficulty Adjustment:    Every 2016 blocks (target: ~10 min/block)
   - Rebuild UTXO set from blockchain
 - [ ] Faucet global cap enforcement:
   - Track total coins distributed via faucet (persisted)
-  - 5,000 coins per request
+  - 100 coins per request
   - Multiple claims allowed (different addresses)
-  - Faucet permanently disabled when total distributed >= 11,000,000
+  - Faucet permanently disabled when total distributed >= 1,000,000
   - Remove per-address cooldown (replaced by global cap logic)
 - [ ] Update ledger to use UTXO instead of account balances
 
@@ -172,8 +172,8 @@ Difficulty Adjustment:    Every 2016 blocks (target: ~10 min/block)
   - Max message size limits
   - Peer reputation system
 - [ ] Final tokenomics verification:
-  - Faucet total cap exactly 11,000,000
-  - Mining rewards sum to exactly 10,000,000
+  - Faucet total cap exactly 1,000,000
+  - Mining rewards sum to exactly 20,000,000
   - Total supply never exceeds 21,000,000
 - [ ] Docker Compose for multi-node local network
 - [ ] Performance benchmarks

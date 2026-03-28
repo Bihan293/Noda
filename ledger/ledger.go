@@ -4,7 +4,7 @@
 //   - Blockchain (ordered sequence of blocks)
 //   - UTXO set (unspent transaction outputs for balance tracking)
 //   - Mempool (pool of unconfirmed transactions)
-//   - Faucet: 5,000 coins per request, global cap 11,000,000 total (no per-address cooldown)
+//   - Faucet: 100 coins per request, global cap 1,000,000 total (no per-address cooldown)
 //   - Mining rewards with halving
 //   - Wallet-level transaction builder (CRITICAL-2)
 //
@@ -24,7 +24,7 @@
 //
 // Genesis ownership:
 //
-//	The genesis supply (11M) is assigned to an address derived from the configured
+//	The genesis supply (1M) is assigned to an address derived from the configured
 //	faucet/genesis private key. The genesis owner is stored in chain metadata and
 //	verified on every restart. A mismatched key causes a fail-fast error.
 package ledger
@@ -57,11 +57,11 @@ const (
 	StorageDir = "noda_data"
 
 	// FaucetAmount is how many coins the faucet distributes per request.
-	FaucetAmount = 5000.0
+	FaucetAmount = 100.0
 
 	// FaucetGlobalCap is the maximum total coins that can be distributed via faucet.
-	// Once 11,000,000 coins have been distributed, the faucet is permanently disabled.
-	FaucetGlobalCap = 11_000_000.0
+	// Once 1,000,000 coins have been distributed, the faucet is permanently disabled.
+	FaucetGlobalCap = 1_000_000.0
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ func NewLedger(filePath string) *Ledger {
 }
 
 // NewLedgerWithOwner creates a new ledger with a genesis blockchain where the
-// genesis supply (11M) belongs to the specified owner address.
+// genesis supply (1M) belongs to the specified owner address.
 // The storePath is used as the storage directory for the new blockstore.
 func NewLedgerWithOwner(storePath string, genesisOwner string) *Ledger {
 	bc := chain.NewBlockchainWithOwner(genesisOwner)
@@ -638,11 +638,11 @@ func (l *Ledger) ValidateAndProcessUserTx(tx block.Transaction) error {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Faucet — Global cap 11M, 5000 coins/request, no per-address cooldown
+// Faucet — Global cap 1M, 100 coins/request, no per-address cooldown
 // ──────────────────────────────────────────────────────────────────────────────
 
 // ProcessFaucet sends FaucetAmount coins from the faucet wallet to the given address.
-// Enforces only the global faucet cap (11M total). No per-address cooldown.
+// Enforces only the global faucet cap (1M total). No per-address cooldown.
 // Multiple claims allowed from any address until the global cap is reached.
 // CRITICAL-3: Faucet transactions now go through the mempool like any other transaction.
 func (l *Ledger) ProcessFaucet(toAddress string) (*block.Transaction, error) {

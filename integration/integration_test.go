@@ -262,11 +262,11 @@ func TestMempoolBlockConfirmation(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestFaucetConstants(t *testing.T) {
-	if ledger.FaucetAmount != 5000 {
-		t.Errorf("FaucetAmount = %f, want 5000", ledger.FaucetAmount)
+	if ledger.FaucetAmount != 100 {
+		t.Errorf("FaucetAmount = %f, want 100", ledger.FaucetAmount)
 	}
-	if ledger.FaucetGlobalCap != 11_000_000 {
-		t.Errorf("FaucetGlobalCap = %f, want 11000000", ledger.FaucetGlobalCap)
+	if ledger.FaucetGlobalCap != 1_000_000 {
+		t.Errorf("FaucetGlobalCap = %f, want 1000000", ledger.FaucetGlobalCap)
 	}
 	if block.GenesisSupply != ledger.FaucetGlobalCap {
 		t.Errorf("GenesisSupply(%f) != FaucetGlobalCap(%f)", block.GenesisSupply, ledger.FaucetGlobalCap)
@@ -2011,9 +2011,9 @@ func TestMiningRewardClampedAtCap(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestFaucetBootstrapAndExhaustSimulation(t *testing.T) {
-	// We can't distribute all 11M in a test (2200 claims × mining), so we verify:
-	// 1. FaucetGlobalCap == GenesisSupply == 11_000_000
-	// 2. Each claim is exactly FaucetAmount (5000)
+	// We can't distribute all 1M in a test (10000 claims × mining), so we verify:
+	// 1. FaucetGlobalCap == GenesisSupply == 1_000_000
+	// 2. Each claim is exactly FaucetAmount (100)
 	// 3. Faucet correctly rejects when exhausted
 
 	if ledger.FaucetGlobalCap != block.GenesisSupply {
@@ -2021,7 +2021,7 @@ func TestFaucetBootstrapAndExhaustSimulation(t *testing.T) {
 	}
 
 	maxClaims := int(ledger.FaucetGlobalCap / ledger.FaucetAmount)
-	expectedMaxClaims := 2200 // 11_000_000 / 5_000
+	expectedMaxClaims := 10000 // 1_000_000 / 100
 	if maxClaims != expectedMaxClaims {
 		t.Errorf("max faucet claims = %d, want %d", maxClaims, expectedMaxClaims)
 	}
